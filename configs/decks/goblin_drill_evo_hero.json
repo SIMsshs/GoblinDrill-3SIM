@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "name": "goblin_drill_evo_hero",
+  "description": "Goblin Demolisher, Tesla, Fire Spirit, Skeletons, Poison, Evo Snowball, Evo Goblin Drill, Hero Knight",
+  "match_forms": true,
+  "cards": [
+    {"engine": "GoblinDemolisher", "replay": "goblin-demolisher", "form": "base"},
+    {"engine": "Tesla", "replay": "tesla", "form": "base"},
+    {"engine": "FireSpirits", "replay": "fire-spirit", "form": "base"},
+    {"engine": "Skeletons", "replay": "skeletons", "form": "base"},
+    {"engine": "Poison", "replay": "poison", "form": "base"},
+    {"engine": "Snowball", "replay": "giant-snowball", "form": "evolution"},
+    {"engine": "GoblinDrill", "replay": "goblin-drill", "form": "evolution"},
+    {"engine": "Knight", "replay": "knight", "form": "hero"}
+  ]
+}

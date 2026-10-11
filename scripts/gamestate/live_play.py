@@ -1,7 +1,7 @@
 """Live play: reader frame -> model -> taps on instance 3, battle after battle.
 
     .venvs\\royalegym\\Scripts\\python.exe scripts\\gamestate\\live_play.py ^
-        --ckpt runs\\tokens\\rs_big_hog\\best.pt
+        --ckpt runs\\tokens\\drill_target_bc\\best.pt
 
 Between battles it navigates with the old bot's screen logic
 (scripts/gamestate/nav.py, ported from scripts/cr_bot.py): Battle in the
@@ -47,6 +47,7 @@ import emulator  # noqa: E402
 from gamestate.live_bridge import CARD_MAP, card_of_form, rs_state_from_frame  # noqa: E402
 from gamestate.memread import GameMemory  # noqa: E402
 from gamestate.nav import Navigator  # noqa: E402
+from sim.deck_config import DEFAULT_DECK_CONFIG, load_deck_config  # noqa: E402
 
 ADB = r"C:\Program Files\Netease\MuMuPlayer\nx_device\15.0\shell\adb.exe"
 CARD_CENTRES = ((334, 1711), (538, 1711), (742, 1711), (946, 1711))   # mumu_overnight_bot
@@ -219,8 +220,9 @@ def battle_result(frame, my_side):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--deck", default="Musketeer,Cannon,IceSpirits,HogRider,Skeletons,IceGolemite,Log,Fireball",
-                    help="deck in the deck-screen order (left to right, top row first)")
+    ap.add_argument("--deck", default="",
+                    help="deck in the deck-screen order; overrides --deck-config")
+    ap.add_argument("--deck-config", type=Path, default=DEFAULT_DECK_CONFIG)
     ap.add_argument("--side", type=int, default=1,
                     help="fallback when the side probe is ambiguous")
     ap.add_argument("--no-cap-rule", action="store_true")
@@ -243,8 +245,14 @@ def main() -> int:
     royalesim, names, ids, cat = RR._setup()
     sub = royalesim.SUBTILE_PER_MILLITILE
     unit_types = _unit_names()
-    deck_rs = [ids[c] for c in args.deck.split(",")]
+    deck_config = load_deck_config(args.deck_config)
+    deck_names = args.deck.split(",") if args.deck else list(deck_config.engine_cards)
+    deck_forms = ([0] * 8 if args.deck else list(deck_config.forms))
+    deck_rs = [ids[c] for c in deck_names]
     agent = RSAgent(args.ckpt)
+    if getattr(agent.model, "ability_actions", 0):
+        print("NOTE: the checkpoint can choose hero abilities offline, but live ability taps are "
+              "disabled until the reader exposes and calibrates that button.")
     torch = agent.torch
 
     log_dir = ROOT / "reports" / "live_play"
@@ -416,7 +424,7 @@ def main() -> int:
                         break
                 if not in_battle:
                     continue
-            state = rs_state_from_frame(f, side, deck_rs, unit_types, cat, sub)
+            state = rs_state_from_frame(f, side, deck_rs, unit_types, cat, sub, deck_forms)
             team = next((t for t in (0, 1) if state["players"][t]["hand"]), None)
             if team is None:
                 continue
@@ -507,6 +515,7 @@ def main() -> int:
             opp_seen = [c - 2 for c in sorted(mem["seen"][1 - team])]
             state["players"][1 - team]["deck"] = (opp_seen + [ids[n] for n in FILLER
                                                              if ids[n] not in opp_seen])[:8]
+            state["players"][1 - team]["forms"] = [0] * len(state["players"][1 - team]["deck"])
             p = state["players"][team]
             # Plays sent but not yet shown by the reader (~1.1 s). Instead of
             # freezing until they land, their slot is blocked and their cost
@@ -529,6 +538,9 @@ def main() -> int:
                 gate, _, _ = agent.model(b, card_ids=b["hand"][:, 0].clamp(min=0))
             g = gate[0].float().numpy()
             g[0] += agent.wait_bias
+            # See the startup note: never guess an uncalibrated paid tap.
+            if len(g) > 5:
+                g[5:] = -1e9
             for slot in range(4):
                 if (slot >= len(p["hand"]) or slot in blocked
                         or spendable < p["hand_costs"][slot] * 1000):

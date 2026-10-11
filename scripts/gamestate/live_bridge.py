@@ -49,6 +49,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from gamestate.memread import GameMemory, _sh  # noqa: E402
+from sim.deck_config import DEFAULT_DECK_CONFIG, load_deck_config  # noqa: E402
 
 CARD_MAP = json.loads((Path(__file__).with_name("card_map.json")).read_text())["cards"]
 TOWER_MIN_HP = 2000          # crown towers; no troop starts this high except a few tanks
@@ -95,9 +96,10 @@ class LiveObs:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--deck", default="Musketeer,Cannon,IceSpirits,HogRider,Skeletons,IceGolemite,Log,Fireball",
+    ap.add_argument("--deck", default="",
                     help="deck in the deck-screen order (left to right, top row first); "
-                         "the reader's hand indexes are positions in this list")
+                         "overrides --deck-config")
+    ap.add_argument("--deck-config", type=Path, default=DEFAULT_DECK_CONFIG)
     ap.add_argument("--side", type=int, default=1,
                     help="our player record's side; 1 in the 2026-10-10 friendlies, UNVERIFIED always")
     ap.add_argument("--seconds", type=int, default=240)
@@ -111,7 +113,10 @@ def main() -> int:
     royalesim, names, ids, cat = RR._setup()
     sub = royalesim.SUBTILE_PER_MILLITILE
     unit_types = _unit_names()
-    deck_rs = [ids[c] for c in args.deck.split(",")]
+    deck_config = load_deck_config(args.deck_config)
+    deck_names = args.deck.split(",") if args.deck else list(deck_config.engine_cards)
+    deck_forms = ([0] * 8 if args.deck else list(deck_config.forms))
+    deck_rs = [ids[c] for c in deck_names]
     agent = RSAgent(args.ckpt)
     torch = agent.torch
     mem = {"seen": {0: set(), 1: set()}, "last": {0: [], 1: []}}
@@ -134,7 +139,7 @@ def main() -> int:
             continue
         if f.get("t", -1) < 0 or "me" not in f:
             continue
-        state = rs_state_from_frame(f, args.side, deck_rs, unit_types, cat, sub)
+        state = rs_state_from_frame(f, args.side, deck_rs, unit_types, cat, sub, deck_forms)
         team = next((t for t in (0, 1) if state["players"][t]["hand"]), None)
         if team is None:
             continue
@@ -153,6 +158,10 @@ def main() -> int:
             gate, _, _ = agent.model(b, card_ids=b["hand"][:, 0].clamp(min=0))
         g = gate[0].float().numpy()
         g[0] += agent.wait_bias
+        # The reader does not yet expose the live ability button state or its
+        # calibrated screen coordinate. Never guess a paid external tap.
+        if len(g) > 5:
+            g[5:] = -1e9
         p = state["players"][team]
         for slot in range(4):
             if slot >= len(p["hand"]) or p["elixir_milli"] < p["hand_costs"][slot] * 1000:
@@ -225,7 +234,7 @@ def card_of_form(name, catalogue):
     return _CARD_BY_NAME.get(base.lower(), -1)
 
 
-def rs_state_from_frame(frame, my_side, deck_rs, unit_types, catalogue, sub):
+def rs_state_from_frame(frame, my_side, deck_rs, unit_types, catalogue, sub, deck_forms=None):
     """A dict with the keys rs_rows.obs_row and RSAgent.rebuilt read."""
     ut_index = {name: i for i, name in enumerate(unit_types)}
     teams = {}                                  # reader side -> RoyaleSim team
@@ -278,11 +287,12 @@ def rs_state_from_frame(frame, my_side, deck_rs, unit_types, catalogue, sub):
     for team in (0, 1):
         players[team] = {"team": team, "tower_hp": tower_hp[team], "tower_max_hp": tower_max[team],
                          "elixir_milli": 0, "hand": [], "hand_costs": [], "deck": [],
-                         "next_card": -1, "crowns": 0}
+                         "forms": [], "abilities": [], "next_card": -1, "crowns": 0}
     t_me = teams[my_side]
     players[t_me].update(
         elixir_milli=int(me[1] / 10) if len(me) > 1 else 0,     # reader raw: 1e-4 elixir
         hand=hand, hand_costs=[catalogue[c][2] for c in hand], deck=list(deck_rs),
+        forms=list(deck_forms or [0] * len(deck_rs)),
         next_card=deck_rs[cyc[0]] if cyc and 0 <= cyc[0] < len(deck_rs) else -1)
     return {"tick": frame["t"], "entities": entities, "players": players,
             "spells": [], "projectiles": [], "game_over": False}

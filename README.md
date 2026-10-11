@@ -84,6 +84,10 @@ python -m pytest tests -q        # confirm the engine is behaving
 > [!NOTE]
 > `[dev]` is enough for everything except driving a real device. Live play additionally needs `[live]`, an Android emulator and a GPU — see [Playing the real game](#4-playing-the-real-game).
 
+> [!TIP]
+> For the exact Evo Goblin Drill / Evo Snowball / Hero Knight imitation-to-PPO pipeline,
+> use the [Korean step-by-step guide](docs/GOBLIN_DRILL_TRAINING_KO.md).
+
 <br>
 
 ---

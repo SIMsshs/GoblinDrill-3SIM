@@ -1,0 +1,7 @@
+# Install a CUDA-capable PyTorch build first if this machine has an NVIDIA GPU:
+# https://pytorch.org/get-started/locally/
+numpy>=1.26,<3
+pyarrow>=18
+pytest>=8
+royaleimitate==0.2.13
+royalesim==0.1.22
