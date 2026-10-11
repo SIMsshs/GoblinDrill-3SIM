@@ -2,7 +2,7 @@
 
     .venvs/buildabot/Scripts/python.exe -m sim.train_tokens --name bc --beta 0
     .venvs/buildabot/Scripts/python.exe -m sim.train_tokens --name awr --beta 0.1
-    ... --finetune-hog --init runs/tokens/awr/best.pt --name awr_hog
+    ... --finetune-target --init runs/tokens/base_bc/best.pt --name drill_bc
 
 Only numpy and torch are needed, so it runs in any environment with CUDA
 PyTorch; it does not import the engine.
@@ -27,10 +27,20 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "il_rows"
 RUNS = ROOT / "runs" / "tokens"
 COLS = ("unit_ids", "unit_feats", "towers", "scalars", "hand", "next", "opp_seen",
-        "opp_last", "opp_last_age", "outcome", "won", "act_card", "act_x", "act_y")
+        "opp_last", "opp_last_age", "ability_ids", "ability_feats", "outcome", "won",
+        "act_card", "act_x", "act_y", "act_gate")
 
 
-def load(split: str, wait_keep: float, trusted_only: bool, hog_only: bool, seed: int = 0,
+def _legacy_gate(hand: np.ndarray, card: np.ndarray) -> np.ndarray:
+    out = np.full(len(card), -1, dtype=np.int16)
+    out[card == 0] = 0
+    for slot in range(4):
+        hit = (card > 0) & (hand[:, slot] == card) & (out < 0)
+        out[hit] = slot + 1
+    return out
+
+
+def load(split: str, wait_keep: float, trusted_only: bool, target_only: bool, seed: int = 0,
          root: Path = DATA):
     rng = np.random.default_rng(seed)
     parts = {c: [] for c in COLS}
@@ -39,13 +49,32 @@ def load(split: str, wait_keep: float, trusted_only: bool, hog_only: bool, seed:
         keep = z["split"] == split
         if trusted_only:
             keep &= z["trusted"]
-        if hog_only:
-            keep &= z["hog"]
+        if target_only:
+            selector = "target" if "target" in z.files else "hog"
+            if selector not in z.files:
+                raise KeyError(f"{path}: no target (or legacy hog) column; rebuild rows")
+            keep &= z[selector]
         waits = z["act_card"] == 0
         keep &= ~waits | (rng.random(len(waits)) < wait_keep)
+        n = len(z["act_card"])
         for c in COLS:
-            parts[c].append(z[c][keep])
+            if c in z.files:
+                value = z[c]
+            elif c == "ability_ids":
+                value = np.zeros((n, 3), dtype=np.int16)
+            elif c == "ability_feats":
+                value = np.zeros((n, 3, 4), dtype=np.float16)
+            elif c == "act_gate":
+                value = _legacy_gate(z["hand"], z["act_card"])
+            else:
+                raise KeyError(f"{path}: missing required column {c}")
+            parts[c].append(value[keep])
+    if not parts["act_card"]:
+        raise FileNotFoundError(f"no shard-*.npz files under {root}")
     data = {c: np.concatenate(v) for c, v in parts.items()}
+    if not len(data["act_card"]):
+        scope = "target deck " if target_only else ""
+        raise ValueError(f"no {scope}{split} rows in {root}; build more replay parts")
     data["unit_feats"] = data["unit_feats"].astype(np.float16)
     return data
 
@@ -108,11 +137,11 @@ def batches(data, size: int, shuffle: bool, device, order=None):
 
 
 @torch.no_grad()
-def evaluate(model, data, device, beta):
+def evaluate(model, data, device, beta, ability_weight=1.0):
     model.eval()
     tot, n = {}, 0
     for b in batches(data, 2048, False, device):
-        _, s = losses(model, b, beta=beta)
+        _, s = losses(model, b, beta=beta, ability_weight=ability_weight)
         k = len(b["act_card"])
         for key, v in s.items():
             tot[key] = tot.get(key, 0.0) + v * k
@@ -132,7 +161,9 @@ def main() -> int:
     ap.add_argument("--wait-keep", type=float, default=0.35)
     ap.add_argument("--all-rows", action="store_true",
                     help="include rows after the match's divergence point")
-    ap.add_argument("--finetune-hog", action="store_true")
+    ap.add_argument("--finetune-target", action="store_true",
+                    help="train only rows whose deck (including configured forms) is the target")
+    ap.add_argument("--finetune-hog", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--init", type=Path)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", type=Path, default=DATA)
@@ -142,6 +173,8 @@ def main() -> int:
     ap.add_argument("--phase-balance", type=float, default=0.0,
                     help="0 = rows as they come; >0 = draw rare game phases (overtime, "
                          "a tower down) more often, weight (1/phase rows)**this")
+    ap.add_argument("--ability-weight", type=float, default=3.0,
+                    help="extra gate-loss weight for rare hero/champion ability presses")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -149,17 +182,27 @@ def main() -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     meta = json.loads((args.data / "vocab.json").read_text())
     t0 = time.time()
-    train = load("train", args.wait_keep, not args.all_rows, args.finetune_hog, args.seed, args.data)
-    val = load("val", args.wait_keep, True, args.finetune_hog, 1, args.data)
-    val_hog = load("val", args.wait_keep, True, True, 1, args.data)
+    target_only = args.finetune_target or args.finetune_hog
+    train = load("train", args.wait_keep, not args.all_rows, target_only, args.seed, args.data)
+    val = load("val", args.wait_keep, True, target_only, 1, args.data)
+    val_target = load("val", args.wait_keep, True, True, 1, args.data)
     print(f"rows: train {len(train['act_card']):,}  val {len(val['act_card']):,}  "
-          f"val(hog) {len(val_hog['act_card']):,}  ({time.time() - t0:.0f}s)", flush=True)
+          f"val(target) {len(val_target['act_card']):,}  ({time.time() - t0:.0f}s)", flush=True)
 
     meta = dict(meta, d=args.d, layers=args.layers, heads=args.heads)
     model = TokenPolicy(meta["n_cards"], meta["n_units"], d=args.d, layers=args.layers,
-                        heads=args.heads).to(device)
+                        heads=args.heads, ability_actions=meta.get("ability_actions", 0),
+                        ability_features=meta.get("ability_features", 4)).to(device)
     if args.init:
-        model.load_state_dict(torch.load(args.init, map_location=device)["model"])
+        init = torch.load(args.init, map_location=device)
+        missing, unexpected = model.load_state_dict(init["model"], strict=False)
+        if unexpected:
+            raise ValueError(f"checkpoint has unexpected parameters: {unexpected}")
+        if missing:
+            allowed = ("ability_in.", "ability_slot_emb.", "ability_type", "ability_query.")
+            if any(not key.startswith(allowed) for key in missing):
+                raise ValueError(f"checkpoint is not architecture-compatible; missing {missing}")
+            print("init checkpoint has no ability head; initialized the new ability head randomly", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     steps = args.epochs * ((len(train["act_card"]) + args.batch - 1) // args.batch)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=steps, pct_start=0.05)
@@ -178,7 +221,7 @@ def main() -> int:
         order = balanced_order(train, args.phase_balance, rng) if args.phase_balance > 0 else None
         for b in batches(train, args.batch, True, device, order=order):
             with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
-                loss, s = losses(model, b, beta=args.beta)
+                loss, s = losses(model, b, beta=args.beta, ability_weight=args.ability_weight)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -188,30 +231,31 @@ def main() -> int:
             if step % 500 == 0:
                 print(f"  ep {epoch} step {step}/{steps} loss {loss.item():.3f} "
                       f"gate {s['gate_acc']:.3f} card {s['card_acc']:.3f} "
-                      f"tile {s['tile_acc']:.3f} near {s['tile_near']:.3f} w {s['mean_w']:.2f}",
+                      f"ability {s['ability_acc']:.3f} tile {s['tile_acc']:.3f} "
+                      f"near {s['tile_near']:.3f} w {s['mean_w']:.2f}",
                       flush=True)
         v = evaluate(model, val, device, 0.0)
-        vh = evaluate(model, val_hog, device, 0.0)
+        vt = evaluate(model, val_target, device, 0.0)
         # Per phase, so a weak phase is not hidden in the average.
-        ph = phase_of(val_hog)
+        ph = phase_of(val_target)
         per_phase = {}
         for i in range(12):
             m = ph == i
             if m.sum() >= 200:
-                sub = {c: arr[m] for c, arr in val_hog.items()}
+                sub = {c: arr[m] for c, arr in val_target.items()}
                 e = evaluate(model, sub, device, 0.0)
                 per_phase[PHASE_NAMES[i]] = {"rows": int(m.sum()), "card": round(e["card_acc"], 3),
                                              "near": round(e["tile_near"], 3)}
-        print("  hog per phase: " + "; ".join(f"{k} ({v_['rows']}) card {v_['card']} near {v_['near']}"
-                                              for k, v_ in per_phase.items()), flush=True)
-        score = vh["card_acc"] + vh["tile_near"]
-        rec = {"epoch": epoch, "val": v, "val_hog": vh, "val_hog_phase": per_phase,
+        print("  target per phase: " + "; ".join(f"{k} ({v_['rows']}) card {v_['card']} near {v_['near']}"
+                                                 for k, v_ in per_phase.items()), flush=True)
+        score = vt["card_acc"] + vt["tile_near"] + 0.25 * vt["ability_acc"]
+        rec = {"epoch": epoch, "val": v, "val_target": vt, "val_target_phase": per_phase,
                "time": time.time() - t0}
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(f"epoch {epoch}: val card {v['card_acc']:.3f} tile {v['tile_acc']:.3f} "
-              f"near {v['tile_near']:.3f} gate {v['gate_acc']:.3f} | hog card {vh['card_acc']:.3f} "
-              f"near {vh['tile_near']:.3f}", flush=True)
+              f"near {v['tile_near']:.3f} gate {v['gate_acc']:.3f} | target card {vt['card_acc']:.3f} "
+              f"near {vt['tile_near']:.3f} ability {vt['ability_acc']:.3f}", flush=True)
         torch.save({"model": model.state_dict(), "meta": meta, "epoch": epoch}, out / "last.pt")
         if score > best:
             best = score

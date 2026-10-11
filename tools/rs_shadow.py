@@ -38,11 +38,12 @@ DEPLOY_TICKS = 20                           # the usual troop deploy time, 1 s (
 
 class Shadow:
     def __init__(self, royalesim, catalogue, me: int, my_deck: List[int], my_levels: List[int],
-                 tower_level: int, prim: Dict[int, int]):
+                 tower_level: int, prim: Dict[int, int], my_forms: Optional[List[int]] = None):
         self.rs = royalesim
         self.cat = catalogue
         self.me, self.opp = me, 1 - me
         self.my_deck, self.my_levels = list(my_deck), list(my_levels)
+        self.my_forms = list(my_forms or [0] * len(my_deck))
         self.tower_level = tower_level
         self.prim = prim
         self.events: List[Event] = []
@@ -139,10 +140,13 @@ class Shadow:
             dealt[team] = order or decks[team]
         lv = {self.me: dict(zip(self.my_deck, self.my_levels)),
               self.opp: {c: (self.opp_cards.get(c) or self.tower_level) for c in decks[self.opp]}}
+        form = {self.me: dict(zip(self.my_deck, self.my_forms)),
+                self.opp: {c: 0 for c in decks[self.opp]}}
         b = self.rs.Battle(card_names=None, slot_of_k=[[0, 1, 2], [0, 1, 2]])
         b.reset(seed=0, decks=[dealt[0], dealt[1]], shuffle=0, start_tick=0,
                 elixir_milli=[6000, 6000], tower_hp=None, spawns=[],
                 levels=[[lv[t][c] or self.tower_level for c in dealt[t]] for t in (0, 1)],
+                forms=[[form[t].get(c, 0) for c in dealt[t]] for t in (0, 1)],
                 tower_levels=[self.tower_level, self.tower_level])
         tick = 0
         self.why = {}

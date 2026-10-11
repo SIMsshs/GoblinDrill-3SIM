@@ -1,6 +1,6 @@
 """Self-play reinforcement learning in RoyaleSim, starting from imitation.
 
-Everything up to now copied pros. This lets the Hog model learn from its own
+Everything up to now copied pros. This lets the target-deck model learn from its own
 results: it plays full RoyaleSim battles under the live configuration (21-tick
 command delay, decisions on a board rebuilt from public information and run
 21 ticks ahead) against a frozen reactive opponent playing the real
@@ -46,7 +46,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
 
 RUNS = ROOT / "runs" / "selfplay"
-KEYS = ("unit_ids", "unit_feats", "towers", "scalars", "hand", "opp_seen", "opp_last", "opp_last_age")
+KEYS = ("unit_ids", "unit_feats", "towers", "scalars", "hand", "opp_seen", "opp_last",
+        "opp_last_age", "ability_ids", "ability_feats")
 DECIDE = 10
 TOP_TILES = 8          # tiles sampled among the model's best legal ones
 EXTRA_TILES = 8        # plus this many random legal tiles from anywhere
@@ -85,17 +86,13 @@ def _sampling_agent():
             g = gate[0].float().numpy().astype(np.float64)
             g[0] += self.wait_bias
             p = state["players"][team]
-            pending_cost = int(p.get("pending_cost", 0) or 0)
-            mask = np.ones(5, bool)
-            for slot in range(4):
-                cost = p["hand_costs"][slot] if slot < len(p["hand_costs"]) else 99
-                if (slot >= len(p["hand"]) or p["elixir_milli"] - pending_cost * 1000 < cost * 1000
-                        or p["hand"][slot] < 0):
-                    mask[1 + slot] = False
+            self.mask_gate(g, battle, state, team)
+            mask = g > -1e8
+            mask[0] = True
             if not mask[1:].any():
                 return None
             q = gate_probs(g, mask)
-            a = int(self.rng.choice(5, p=q))
+            a = int(self.rng.choice(len(q), p=q))
             rec = {k: np.asarray(row[k]) for k in KEYS}
             rec.update(next=int(row["next"]), mask=mask, gate_a=a, logq_gate=float(math.log(q[a])),
                        v=float(1 / (1 + math.exp(-float(value[0, 1])))), tile_a=-1, logq_tile=0.0,
@@ -103,6 +100,9 @@ def _sampling_agent():
             if a == 0:
                 self.records.append(rec)
                 return None
+            if a >= 5:
+                self.records.append(rec)
+                return (team, a - 1, 0, 0)
             slot = a - 1
             with torch.no_grad():
                 _, tile, _ = self.model(b, card_ids=b["hand"][:, slot])
@@ -154,7 +154,7 @@ def tile_probs(lg):
 
 
 def gate_probs(g, mask):
-    """The live / evaluator gate as a distribution over wait + 4 slots.
+    """The live gate as a distribution over wait, four cards and abilities.
 
     Evaluator: wait with probability p_wait ** (DECIDE / 20), where p_wait is
     the softmax wait share; otherwise play. Here the slot played is drawn in
@@ -165,7 +165,7 @@ def gate_probs(g, mask):
     pr /= pr.sum()
     qw = float(pr[0]) ** (DECIDE / 20)
     s = pr[1:].sum()
-    q = np.zeros(5)
+    q = np.zeros(len(g))
     q[0] = qw
     q[1:] = (1 - qw) * pr[1:] / max(s, 1e-12)
     q = np.where(mask, q, 0.0)
@@ -182,13 +182,15 @@ def _collect_one(task):
     return out["result"], out["crowns"], r, out["records"]
 
 
-def pick_matches(n, seed, split="train"):
-    """Hog 2.6 matches from IL_Replay (train split by default), shuffled by seed."""
+def pick_matches(n, seed, split="train", deck_config=None):
+    """Target-deck matches from IL_Replay, shuffled by seed."""
     import random
     import pyarrow.parquet as pq
     import rs_rows as RR
+    from sim.deck_config import load_deck_config
     from royalesim_redrive import CORPUS, base_key
     _, names, _, _ = RR._setup()
+    target = load_deck_config(deck_config)
     parts = sorted((CORPUS / "replays").glob("part-*.parquet"))
     rnd = random.Random(seed)
     rnd.shuffle(parts)
@@ -200,12 +202,7 @@ def pick_matches(n, seed, split="train"):
             if r["game_mode"] not in RR.MODES or RR.split_of(r["replay_tag"]) != split:
                 continue
             p = json.loads(r["payload_json"])
-            try:
-                sides = [frozenset(names.get(base_key(c["card_key"])[0])
-                                   for c in p["battle"][s]["players"][0]["deck"]) for s in ("team", "opponent")]
-            except (KeyError, IndexError):
-                continue
-            if any(None in s for s in sides) or RR.HOG26 not in sides or sides[0] == sides[1]:
+            if target.target_seat(p.get("battle", {})) is None:
                 continue
             p.setdefault("source", {})["replay_tag"] = r["replay_tag"]
             picked.append(json.dumps(p))
@@ -216,8 +213,9 @@ def pick_matches(n, seed, split="train"):
 
 def collect(args):
     from concurrent.futures import ProcessPoolExecutor
-    picked = pick_matches(args.matches, args.seed)
-    tasks = [(t, args.ckpt, "agent", args.seed * 1000 + k, args.opponent, 21, -21, False, False, False)
+    picked = pick_matches(args.matches, args.seed, deck_config=args.deck_config)
+    tasks = [(t, args.ckpt, "agent", args.seed * 1000 + k, args.opponent, 21, -21,
+              False, False, False, str(args.deck_config))
              for k, t in enumerate(picked)]
     t0 = time.time()
     recs, results = [], []
@@ -230,6 +228,10 @@ def collect(args):
             for row in rows:
                 row["ret"] = r
                 recs.append(row)
+    if not recs:
+        raise RuntimeError(
+            "self-play produced no decisions; download the complete replay corpus, "
+            "check the exact deck/forms in --deck-config, and verify the checkpoint")
     out = {k: np.stack([x[k] for x in recs]) for k in recs[0]}
     np.savez_compressed(args.out, **out)
     w = results.count("win") / max(1, len(results))
@@ -251,7 +253,9 @@ def train(args):
         blob = torch.load(path, map_location="cpu")
         m = blob["meta"]
         net = TokenPolicy(m["n_cards"], m["n_units"], d=m.get("d", 192),
-                          layers=m.get("layers", 4), heads=m.get("heads", 6))
+                          layers=m.get("layers", 4), heads=m.get("heads", 6),
+                          ability_actions=m.get("ability_actions", 0),
+                          ability_features=m.get("ability_features", 4))
         net.load_state_dict(blob["model"])
         return net.to(dev), blob
 
@@ -273,9 +277,10 @@ def train(args):
         for i in range(0, n, args.batch):
             idx = perm[i:i + args.batch]
             b = {k: torch.as_tensor(d[k][idx]).to(dev) for k in KEYS}
-            for k in ("unit_ids", "hand", "opp_seen", "opp_last"):
+            for k in ("unit_ids", "hand", "opp_seen", "opp_last", "ability_ids"):
                 b[k] = b[k].long()
             b["unit_feats"] = b["unit_feats"].float()
+            b["ability_feats"] = b["ability_feats"].float()
             b["opp_last_age"] = b["opp_last_age"].float()
             b["next"] = torch.as_tensor(d["next"][idx]).long().to(dev)
             mask = torch.as_tensor(d["mask"][idx]).to(dev)
@@ -284,8 +289,10 @@ def train(args):
             adv = torch.as_tensor(adv_all[idx]).float().to(dev)
             ret = torch.as_tensor(d["ret"][idx]).float().to(dev)
             hand = b["hand"]
-            slot = (a - 1).clamp(min=0)
+            played = (a >= 1) & (a <= 4)
+            slot = (a - 1).clamp(min=0, max=3)
             card = hand.gather(1, slot[:, None])[:, 0].clamp(min=0)
+            card = torch.where(played, card, torch.zeros_like(card))
             gate, tile, value = model(b, card_ids=card)
             with torch.no_grad():
                 rgate, rtile, _ = ref(b, card_ids=card)
@@ -306,7 +313,6 @@ def train(args):
             new = lq.gather(1, a[:, None])[:, 0]
             # tile: log-softmax over the recorded legal candidates
             cands = torch.as_tensor(d["tile_cands"][idx]).long().to(dev)
-            played = a > 0
             cmask = cands >= 0
             tl = tile.float().gather(1, cands.clamp(min=0)) / TILE_TEMP
             tl = tl.masked_fill(~cmask, -1e9)
@@ -350,8 +356,8 @@ def loop(args):
     run = RUNS / args.name
     run.mkdir(parents=True, exist_ok=True)
     (run / "args.json").write_text(json.dumps(vars(args), default=str))
-    rg = ROOT / ".venvs" / "royalegym" / "Scripts" / "python.exe"
-    bb = ROOT / ".venvs" / "buildabot" / "Scripts" / "python.exe"
+    rg = Path(sys.executable)
+    bb = Path(args.train_python) if args.train_python else rg
     me = str(Path(__file__).resolve())
     # args.json next to each checkpoint so RSAgent reads the right wait_keep
     init_args = Path(args.ref or args.init).with_name("args.json")
@@ -369,7 +375,8 @@ def loop(args):
         t0 = time.time()
         c = subprocess.run([str(rg), me, "collect", "--ckpt", str(ckpt), "--opponent", args.opponent,
                             "--matches", str(args.matches), "--workers", str(args.workers),
-                            "--seed", str(it + 1), "--out", str(data)],
+                            "--seed", str(it + 1), "--out", str(data),
+                            "--deck-config", str(args.deck_config)],
                            capture_output=True, text=True)
         if c.returncode != 0:
             print(c.stderr[-2000:], flush=True)
@@ -390,7 +397,8 @@ def loop(args):
         if args.eval_every and (it + 1) % args.eval_every == 0:
             e = subprocess.run([str(rg), str(ROOT / "tools" / "rs_eval.py"), "--ckpt", str(nxt),
                                 "--opponent-ckpt", args.eval_opponent, "--matches", str(args.eval_matches),
-                                "--workers", str(args.workers), "--delay", "21", "--lead", "-21"],
+                                "--workers", str(args.workers), "--delay", "21", "--lead", "-21",
+                                "--deck-config", str(args.deck_config)],
                                capture_output=True, text=True)
             line = [l for l in e.stdout.splitlines() if " wins (" in l]
             rec["eval"] = line[-1] if line else e.stderr[-300:]
@@ -410,6 +418,8 @@ def main() -> int:
     c.add_argument("--workers", type=int, default=4)
     c.add_argument("--seed", type=int, default=1)
     c.add_argument("--out", required=True)
+    c.add_argument("--deck-config", type=Path,
+                   default=ROOT / "configs" / "decks" / "hog_26.json")
     t = sp.add_parser("train")
     t.add_argument("--ckpt", required=True)
     t.add_argument("--ref", required=True)
@@ -438,6 +448,10 @@ def main() -> int:
     lp.add_argument("--eval-matches", type=int, default=300)
     lp.add_argument("--eval-opponent", default=str(ROOT / "runs" / "tokens" / "rs_bc" / "ep1.pt"),
                     help="the reference every earlier number was measured against")
+    lp.add_argument("--deck-config", type=Path,
+                    default=ROOT / "configs" / "decks" / "hog_26.json")
+    lp.add_argument("--train-python", default="",
+                    help="Python executable with CUDA torch; default is the current interpreter")
     args = ap.parse_args()
     return {"collect": collect, "train": train, "loop": loop}[args.cmd](args) or 0
 

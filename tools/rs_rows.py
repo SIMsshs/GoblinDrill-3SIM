@@ -35,14 +35,17 @@ from statistics import mode
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
+from sim.deck_config import (DEFAULT_DECK_CONFIG, ability_button_for_event,
+                             ability_buttons, load_deck_config)  # noqa: E402
 from royalesim_redrive import CORPUS, base_key, deal_order  # noqa: E402
 
 OUT = ROOT / "data" / "rs_rows"
 MAX_UNITS, UF = 48, 7
 HORIZON, WAIT_EVERY, CHUNK = 200, 20, 10
-HOG26 = frozenset({"Cannon", "Fireball", "HogRider", "IceGolemite", "IceSpirits",
-                   "Musketeer", "Skeletons", "Log"})
+# Kept for older callers. New code selects the target through --deck-config.
+HOG26 = frozenset(load_deck_config(DEFAULT_DECK_CONFIG).engine_cards)
 MODES = {"Ranked", "Ladder", "1v1 Battle", "Grand Challenge", "Classic Challenge"}
 F = None   # field indexes, filled on first use
 # --live-compat: unit tokens carry only what the live memory reader provides.
@@ -129,6 +132,13 @@ def obs_row(state, team, sub, mem, tick, live=None):
     opp = 1 - team
     seen = sorted(mem["seen"][opp])[:8]
     last = mem["last"][opp][-4:]
+    ability_ids = np.zeros(3, dtype=np.int16)
+    ability_feats = np.zeros((3, 4), dtype=np.float16)
+    for k, ability in enumerate(p.get("abilities", [])[:3]):
+        available, spent, cost, card_id, cooldown = ability[:5]
+        ability_ids[k] = int(card_id) + 2 if int(card_id) >= 0 else 0
+        ability_feats[k] = (float(available), float(spent), float(cost) / 10.0,
+                            min(1.0, float(cooldown) / 600.0))
     t_ms = tick * 50
     return {
         "tick": tick, "side": 1 if team == 0 else -1, "hand_exact": True,
@@ -142,11 +152,13 @@ def obs_row(state, team, sub, mem, tick, live=None):
         "opp_last": np.asarray([c for c, _ in last] + [0] * (4 - len(last)), dtype=np.int16),
         "opp_last_age": np.asarray([min(1.0, (tick - t) / 400) for _, t in last]
                                    + [1.0] * (4 - len(last)), dtype=np.float16),
+        "ability_ids": ability_ids, "ability_feats": ability_feats,
     }
 
 
-def rows_for(payload: dict, ctx):
+def rows_for(payload: dict, ctx, target_config=None):
     royalesim, names, ids, cat = ctx
+    target_config = target_config or load_deck_config(DEFAULT_DECK_CONFIG)
     sub = royalesim.SUBTILE_PER_MILLITILE
     battle = payload["battle"]
     decks, forms, levels = [], [], []
@@ -166,10 +178,14 @@ def rows_for(payload: dict, ctx):
         decks.append(deck)
         forms.append(form)
         levels.append(level)
-    events = sorted((e for e in payload["events"] if e["kind"] == "play_card"),
+    buttons = [ability_buttons(decks[s], forms[s], cat) for s in (0, 1)]
+    events = sorted((e for e in payload["events"]
+                     if e["kind"] in ("play_card", "activate_ability")),
                     key=lambda e: (e["replay_tick_20hz"], e["source_index"]))
     plays = {0: [], 1: []}
     for e in events:
+        if e["kind"] != "play_card":
+            continue
         seat = 0 if e["side"] == "team" else 1
         name = names.get(base_key(e["card_key"])[0])
         u = e["coordinates"]["native_world_units"]
@@ -196,8 +212,22 @@ def rows_for(payload: dict, ctx):
     result = str(battle.get("result", "")).lower()
     won_team = 1.0 if result in ("victory", "win") else 0.0 if result in ("defeat", "loss") else 0.5
     won = {rs[0]: won_team, rs[1]: 1.0 - won_team}
-    queue = sorted([(t, rs[s], c, x, y) for s in (0, 1) for (t, c, x, y) in plays[s]])
-    play_ticks = {0: [q[0] for q in queue if q[1] == 0], 1: [q[0] for q in queue if q[1] == 1]}
+    queue = []
+    for e in events:
+        seat = 0 if e["side"] == "team" else 1
+        tick_e = int(e["replay_tick_20hz"])
+        source = int(e.get("source_index", 0))
+        if e["kind"] == "activate_ability":
+            button = ability_button_for_event(e, buttons[seat], names)
+            if button is not None:
+                queue.append((tick_e, source, rs[seat], "ability", button, 0, 0))
+        else:
+            name = names.get(base_key(e["card_key"])[0])
+            u = e["coordinates"]["native_world_units"]
+            queue.append((tick_e, source, rs[seat], "play", name, int(u["x"]), int(u["y"])))
+    queue.sort(key=lambda q: (q[0], q[1]))
+    play_ticks = {0: [q[0] for q in queue if q[2] == 0],
+                  1: [q[0] for q in queue if q[2] == 1]}
     mem = {"seen": {0: set(), 1: set()}, "last": {0: [], 1: []}}
     rows, track = [], []
     cut = 10 ** 9
@@ -218,28 +248,37 @@ def rows_for(payload: dict, ctx):
             i += 1
         cmds = []
         acting = set()
-        for (_, team, card, x, y) in due:
+        for (_, _, team, kind, action, x, y) in due:
             acting.add(team)
-            cid = ids[card]
-            hand = state["players"][team]["hand"]
-            if team_seat == 1:
-                x, y = 18_000 - x, 32_000 - y
-            ox, oy = own(x * sub, y * sub, team, sub)
             row = obs_row(state, team, sub, mem, tick)
-            row["action"] = (cid + 2, int(min(17, max(0, ox // 1000))), int(min(31, max(0, oy // 1000))))
+            if kind == "ability":
+                row["action"] = (0, 0, 0)
+                row["act_gate"] = 5 + int(action)
+                cmds.append((team, 4 + int(action), 0, 0))
+            else:
+                card = action
+                cid = ids[card]
+                hand = state["players"][team]["hand"]
+                if team_seat == 1:
+                    x, y = 18_000 - x, 32_000 - y
+                ox, oy = own(x * sub, y * sub, team, sub)
+                row["action"] = (cid + 2, int(min(17, max(0, ox // 1000))),
+                                 int(min(31, max(0, oy // 1000))))
+                row["act_gate"] = 1 + hand.index(cid) if cid in hand else -1
+                if cid in hand:
+                    cmds.append((team, hand.index(cid), x * sub, y * sub))
+                elif cut > tick:
+                    cut = tick
+                mem["seen"][team].add(cid + 2)
+                mem["last"][team].append((cid + 2, tick))
             rows.append(row)
-            if cid in hand:
-                cmds.append((team, hand.index(cid), x * sub, y * sub))
-            elif cut > tick:
-                cut = tick
-            mem["seen"][team].add(cid + 2)
-            mem["last"][team].append((cid + 2, tick))
         if tick % WAIT_EVERY == 0:
             for team in (0, 1):
                 soon = any(tick < t <= tick + 10 for t in play_ticks[team])
                 if team not in acting and not soon and tick > 0:
                     row = obs_row(state, team, sub, mem, tick)
                     row["action"] = (0, 0, 0)
+                    row["act_gate"] = 0
                     rows.append(row)
         nxt = queue[i][0] if i < len(queue) else end + 1
         step = max(1, min(nxt, (tick // WAIT_EVERY + 1) * WAIT_EVERY) - tick)
@@ -261,27 +300,30 @@ def rows_for(payload: dict, ctx):
         row["outcome"] = float((opp_lost[a] - opp_lost[z]) - (own_lost[a] - own_lost[z]))
         row["trusted"] = row["tick"] + HORIZON <= cut
         row["won"] = won[team]
-        row["hog"] = frozenset(decks[seat_of[team]]) == HOG26
+        replay_side = "team" if seat_of[team] == 0 else "opponent"
+        row["target"] = target_config.matches_replay_cards(
+            battle[replay_side]["players"][0]["deck"])
     return rows, "ok"
 
 
 FIELDS = ("tick", "side", "hand_exact", "unit_ids", "unit_feats", "towers", "scalars",
-          "hand", "next", "opp_seen", "opp_last", "opp_last_age", "outcome", "trusted",
-          "won", "hog")
+          "hand", "next", "opp_seen", "opp_last", "opp_last_age", "ability_ids",
+          "ability_feats", "outcome", "trusted", "won", "target", "act_gate")
 
 
-def build(batch_id, payload_texts, live=False, out_dir=None):
+def build(batch_id, payload_texts, live=False, out_dir=None, deck_config=None):
     global LIVE, OUT
     LIVE = live
     if out_dir:
         OUT = Path(out_dir)
     ctx = _setup()
+    target_config = load_deck_config(deck_config)
     rows, tags, skipped = [], [], {}
     for text in payload_texts:
         p = json.loads(text)
         tag = p["source"]["replay_tag"]
         try:
-            r, why = rows_for(p, ctx)
+            r, why = rows_for(p, ctx, target_config)
         except Exception as exc:
             r, why = None, f"error {type(exc).__name__}"
         if r is None:
@@ -309,6 +351,12 @@ def main() -> int:
     ap.add_argument("--live-compat", action="store_true",
                     help="unit tokens limited to what the live reader provides")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--deck-config", type=Path, default=DEFAULT_DECK_CONFIG,
+                    help="target deck JSON; exact forms are matched when match_forms is true")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="deterministic reservoir sample of non-target matches")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="replace existing shard-*.npz and vocab.json in --out")
     args = ap.parse_args()
     global OUT, LIVE
     LIVE = args.live_compat
@@ -316,8 +364,19 @@ def main() -> int:
         OUT = args.out
     import pyarrow.parquet as pq
     royalesim, names, ids, cat = _setup()
+    target_config = load_deck_config(args.deck_config)
+    existing = sorted(OUT.glob("shard-*.npz"))
+    if existing and not args.overwrite:
+        raise SystemExit(f"{OUT} already contains {len(existing)} shards; choose a new --out "
+                         "or pass --overwrite to rebuild it without mixing datasets")
+    if args.overwrite:
+        for path in existing:
+            path.unlink()
+        (OUT / "vocab.json").unlink(missing_ok=True)
     t0 = time.time()
-    hog, others = [], []
+    target, others = [], []
+    rng = np.random.default_rng(args.seed)
+    n_other = 0
     parts = sorted((CORPUS / "replays").glob("part-*.parquet"))
     if args.limit_parts:
         parts = parts[:args.limit_parts]
@@ -326,24 +385,34 @@ def main() -> int:
             if r["game_mode"] not in MODES:
                 continue
             p = json.loads(r["payload_json"])
-            sides = []
             ok = True
             for side in ("team", "opponent"):
                 pl = p["battle"][side]["players"]
                 if len(pl) != 1:
                     ok = False
                     break
-                sides.append(frozenset(names.get(base_key(c["card_key"])[0]) for c in pl[0]["deck"]))
-            if not ok or any(None in s for s in sides):
+                if any(names.get(base_key(c["card_key"])[0]) is None for c in pl[0]["deck"]):
+                    ok = False
+                    break
+            if not ok:
                 continue
             p.setdefault("source", {})["replay_tag"] = r["replay_tag"]
             text = json.dumps(p)
-            if HOG26 in sides:
-                hog.append(text)
-            elif len(others) < args.others:
-                others.append(text)
-    picked = hog + others
-    print(f"selected {len(hog):,} Hog 2.6 + {len(others):,} others ({time.time() - t0:.0f}s)", flush=True)
+            if target_config.target_seat(p["battle"]) is not None:
+                target.append(text)
+            elif args.others:
+                # Reservoir sampling keeps a representative fixed-size sample
+                # while the full corpus is scanned for every rare target deck.
+                n_other += 1
+                if len(others) < args.others:
+                    others.append(text)
+                else:
+                    replace = int(rng.integers(n_other))
+                    if replace < args.others:
+                        others[replace] = text
+    picked = target + others
+    print(f"selected {len(target):,} {target_config.label} + {len(others):,} others "
+          f"({time.time() - t0:.0f}s)", flush=True)
     OUT.mkdir(parents=True, exist_ok=True)
     unit_types = json.loads(royalesim.Battle(card_names=None, slot_of_k=[[0, 1, 2], [0, 1, 2]])
                             .unit_types_json())
@@ -353,11 +422,14 @@ def main() -> int:
         "live_compat": LIVE,
         "cards": {row[0]: i + 2 for i, row in enumerate(cat)},
         "units": {u: i + 2 for i, u in enumerate(unit_types)},
-        "engine": "royalesim", "version": getattr(royalesim, "__version__", "?")}))
+        "ability_actions": 3, "ability_features": 4,
+        "target_deck": target_config.metadata(),
+        "engine": "royalesim", "version": getattr(royalesim, "__version__", "?")}, indent=2))
     batches = [picked[i:i + args.batch] for i in range(0, len(picked), args.batch)]
     total, skipped = 0, {}
     with ProcessPoolExecutor(args.workers) as pool:
-        futs = [pool.submit(build, k, b, LIVE, str(OUT)) for k, b in enumerate(batches)]
+        futs = [pool.submit(build, k, b, LIVE, str(OUT), str(target_config.source))
+                for k, b in enumerate(batches)]
         for n, f in enumerate(as_completed(futs), 1):
             bid, rows, sk = f.result()
             total += rows

@@ -49,7 +49,9 @@ class TokenAgent:
         blob = torch.load(checkpoint, map_location=device)
         meta = blob["meta"]
         self.model = TokenPolicy(meta["n_cards"], meta["n_units"], d=meta.get("d", 192),
-                                 layers=meta.get("layers", 4), heads=meta.get("heads", 6)).to(device).eval()
+                                 layers=meta.get("layers", 4), heads=meta.get("heads", 6),
+                                 ability_actions=meta.get("ability_actions", 0),
+                                 ability_features=meta.get("ability_features", 4)).to(device).eval()
         self.model.load_state_dict(blob["model"])
         self.side = side
         self.device = device
@@ -144,6 +146,10 @@ class TokenAgent:
         gate, _, _ = self.model(b, card_ids=b["hand"][:, 0].clamp(min=0))
         gate = gate[0].float().cpu().numpy()
         gate[0] += self.wait_bias
+        # This adapter drives HastyCR's older Match API, not RoyaleSim's
+        # explicit ability-button slots. The RoyaleSim agent handles them.
+        if len(gate) > 5:
+            gate[5:] = -1e9
         for slot, card in enumerate(player.hand[:4]):
             if not match.can_play(self.side, card):
                 gate[1 + slot] = -1e9
@@ -152,9 +158,9 @@ class TokenAgent:
         p = np.exp(gate - gate.max())
         p /= p.sum()
         p_wait = float(p[0]) ** (self.decide_ms / 1000.0)
-        if self.rng.random() < p_wait or not np.isfinite(gate[1:]).any() or gate[1:].max() < -1e8:
+        if self.rng.random() < p_wait or not np.isfinite(gate[1:5]).any() or gate[1:5].max() < -1e8:
             return None
-        slots = gate[1:]
+        slots = gate[1:5]
         if self.sample:
             q = np.exp(slots - slots.max())
             choice = 1 + int(self.rng.choice(4, p=q / q.sum()))

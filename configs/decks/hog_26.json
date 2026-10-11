@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "name": "hog_26",
+  "description": "Legacy Hog 2.6 target; forms are intentionally ignored to preserve the original row selection.",
+  "match_forms": false,
+  "cards": [
+    {"engine": "Cannon", "replay": "cannon", "form": "any"},
+    {"engine": "Fireball", "replay": "fireball", "form": "any"},
+    {"engine": "HogRider", "replay": "hog-rider", "form": "any"},
+    {"engine": "IceGolemite", "replay": "ice-golem", "form": "any"},
+    {"engine": "IceSpirits", "replay": "ice-spirit", "form": "any"},
+    {"engine": "Musketeer", "replay": "musketeer", "form": "any"},
+    {"engine": "Skeletons", "replay": "skeletons", "form": "any"},
+    {"engine": "Log", "replay": "the-log", "form": "any"}
+  ]
+}

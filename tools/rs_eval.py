@@ -1,4 +1,4 @@
-"""Ghost screen in RoyaleSim: a token-policy checkpoint plays the Hog 2.6 side
+"""Ghost screen in RoyaleSim: a token-policy checkpoint plays a configured target side
 of held-out recorded matches while the other side replays what the real
 opponent did, tick for tick.
 
@@ -6,7 +6,7 @@ opponent did, tick for tick.
         --matches 300 [--search]
 
 Two numbers per run, on the same matches:
-* `pro`: the recorded Hog player's own plays replayed against the same ghost.
+* `pro`: the recorded target-deck player's plays replayed against the same ghost.
   This is what the real player achieves in this engine - the bar.
 * `agent`: the checkpoint in that seat.
 
@@ -34,6 +34,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import rs_rows as RR  # noqa: E402
+from sim.deck_config import (DEFAULT_DECK_CONFIG, ability_button_for_event,
+                             ability_buttons, load_deck_config)  # noqa: E402
 from royalesim_redrive import CORPUS, base_key, deal_order  # noqa: E402
 
 DECIDE = 10           # ticks between agent decisions (0.5 s)
@@ -236,7 +238,7 @@ class RSAgent:
         mine = ordered[:8]
         opp = state["players"][1 - team]["deck"]
         spawns = []
-        prim, by_unit = _spawn_tables()
+        prim, by_unit = _spawn_tables(royalesim)
         for e in state["entities"]:
             if e[F["tower_slot"]] >= 0 or e[F["hp"]] <= 0:
                 continue
@@ -261,12 +263,17 @@ class RSAgent:
         b = royalesim.Battle(card_names=None, slot_of_k=[[0, 1, 2], [0, 1, 2]])
         decks = [None, None]
         decks[team], decks[1 - team] = mine[:8], list(opp)[:8]
+        form_by_card = {card: form for card, form in zip(deck, me.get("forms", []))}
+        forms = [None, None]
+        forms[team] = [form_by_card.get(card, 0) for card in mine[:8]]
+        forms[1 - team] = list(state["players"][1 - team].get("forms", []))[:8]
+        forms[1 - team] += [0] * (len(decks[1 - team]) - len(forms[1 - team]))
         elixir = [0, 0]
         elixir[team] = me["elixir_milli"]
         towers = [state["players"][t]["tower_hp"] for t in (0, 1)]
         try:
             b.reset(seed=0, decks=decks, shuffle=0, start_tick=state["tick"],
-                    elixir_milli=elixir, tower_hp=towers, spawns=spawns)
+                    elixir_milli=elixir, tower_hp=towers, spawns=spawns, forms=forms)
         except Exception as exc:
             self.rebuild_error = f"{type(exc).__name__}: {exc}"
             return None
@@ -280,7 +287,9 @@ class RSAgent:
         meta = blob["meta"]
         self.torch = torch
         self.model = TokenPolicy(meta["n_cards"], meta["n_units"], d=meta.get("d", 192),
-                                 layers=meta.get("layers", 4), heads=meta.get("heads", 6)).eval()
+                                 layers=meta.get("layers", 4), heads=meta.get("heads", 6),
+                                 ability_actions=meta.get("ability_actions", 0),
+                                 ability_features=meta.get("ability_features", 4)).eval()
         self.model.load_state_dict(blob["model"])
         # A live-compatible checkpoint was trained on card-id unit tokens.
         self.live = bool(meta.get("live_compat", False))
@@ -300,14 +309,36 @@ class RSAgent:
     def batch(self, row):
         t = self.torch
         keys = ("unit_ids", "unit_feats", "towers", "scalars", "hand", "opp_seen",
-                "opp_last", "opp_last_age")
+                "opp_last", "opp_last_age", "ability_ids", "ability_feats")
         b = {k: t.as_tensor(np.asarray(row[k])[None]) for k in keys}
-        for k in ("unit_ids", "hand", "opp_seen", "opp_last"):
+        for k in ("unit_ids", "hand", "opp_seen", "opp_last", "ability_ids"):
             b[k] = b[k].long()
         b["unit_feats"] = b["unit_feats"].float()
+        b["ability_feats"] = b["ability_feats"].float()
         b["opp_last_age"] = b["opp_last_age"].float()
         b["next"] = t.as_tensor([int(row["next"])]).long()
         return b
+
+    def mask_gate(self, gate, battle, state, team):
+        """Mask card and ability logits using RoyaleSim's public legality."""
+        p = state["players"][team]
+        pending_cost = int(p.get("pending_cost", 0) or 0)
+        spendable = p["elixir_milli"] - pending_cost * 1000
+        for slot in range(4):
+            cost = p["hand_costs"][slot] if slot < len(p["hand_costs"]) else 99
+            if slot >= len(p["hand"]) or spendable < cost * 1000 or p["hand"][slot] < 0:
+                gate[1 + slot] = -1e9
+        abilities = p.get("abilities", [])
+        for button in range(max(0, len(gate) - 5)):
+            legal = button < len(abilities)
+            if legal:
+                available, spent, cost = abilities[button][:3]
+                legal = bool(available) and not bool(spent) and spendable >= int(cost) * 1000
+            if legal and battle is not None:
+                legal = battle.check_deploy(team, 4 + button, 0, 0) == 0
+            if not legal:
+                gate[5 + button] = -1e9
+        return gate
 
     def act(self, battle, state, team, mem, tick, sub, royalesim):
         self._team = team
@@ -325,17 +356,15 @@ class RSAgent:
         g = gate[0].float().numpy()
         g[0] += self.wait_bias
         p = state["players"][team]
-        pending_cost = int(p.get("pending_cost", 0) or 0)
-        for slot in range(4):
-            cost = p["hand_costs"][slot] if slot < len(p["hand_costs"]) else 99
-            if (slot >= len(p["hand"]) or p["elixir_milli"] - pending_cost * 1000 < cost * 1000
-                    or p["hand"][slot] < 0):
-                g[1 + slot] = -1e9
+        self.mask_gate(g, battle, state, team)
         pr = np.exp(g - g.max())
         pr /= pr.sum()
         if self.rng.random() < float(pr[0]) ** (DECIDE / 20) or g[1:].max() < -1e8:
             return None
-        slot = int(np.argmax(g[1:]))
+        action = 1 + int(np.argmax(g[1:]))
+        if action >= 5:
+            return (team, action - 1, 0, 0)
+        slot = action - 1
         with self.torch.no_grad():
             _, tile, _ = self.model(b, card_ids=b["hand"][:, slot])
         order = np.argsort(-tile[0].float().numpy())
@@ -362,11 +391,26 @@ def _unit_names():
     return _UNITS
 
 
-def _spawn_tables():
-    """card id -> the unit type a spawn of it makes, and the inverse."""
+def _spawn_tables(royalesim):
+    """Card id -> primary unit type, derived from RoyaleSim's public API.
+
+    Older checkouts expected an untracked ``data/rs_rows/spawn_primary.json``
+    side file.  Deriving it makes fresh clones and custom row-output folders
+    self-contained. ``unit_hitpoints`` lists the card's own/primary unit first.
+    """
     if not _SPAWN:
-        raw = json.loads((ROOT / "data" / "rs_rows" / "spawn_primary.json").read_text())
-        prim = {int(k): v for k, v in raw["primary"].items()}
+        battle = royalesim.Battle(card_names=None, slot_of_k=[[0, 1, 2], [0, 1, 2]])
+        catalogue = json.loads(battle.catalogue_json())
+        unit_types = json.loads(battle.unit_types_json())
+        unit_id = {name: i for i, name in enumerate(unit_types)}
+        prim = {}
+        for card_id in range(len(catalogue)):
+            try:
+                rows = battle.unit_hitpoints(card_id, battle.card_level())
+            except ValueError:
+                continue
+            if rows and rows[0][1] in unit_id:
+                prim[card_id] = unit_id[rows[0][1]]
         by_unit = {}
         for card, unit in sorted(prim.items()):
             by_unit.setdefault(unit, card)
@@ -402,15 +446,17 @@ class RSSearchAgent(RSAgent):
         g = gate[0].float().numpy()
         g[0] += self.wait_bias
         p = state["players"][team]
-        for slot in range(4):
-            cost = p["hand_costs"][slot] if slot < len(p["hand_costs"]) else 99
-            if slot >= len(p["hand"]) or p["elixir_milli"] < cost * 1000:
-                g[1 + slot] = -1e9
+        self.mask_gate(g, battle, state, team)
         pr = np.exp(g - g.max())
         pr /= pr.sum()
         if self.rng.random() < float(pr[0]) ** (DECIDE / 20) or g[1:].max() < -1e8:
             return None
-        slots = [s for s in np.argsort(-g[1:]) if g[1 + s] > -1e8][:self.k_cards]
+        action = 1 + int(np.argmax(g[1:]))
+        # Ability presses have no placement tile. Their learned gate decision
+        # is already checked by RoyaleSim; search is only needed for placement.
+        if action >= 5:
+            return (team, action - 1, 0, 0)
+        slots = [s for s in np.argsort(-g[1:5]) if g[1 + s] > -1e8][:self.k_cards]
         cands = []
         for slot in slots:
             with self.torch.no_grad():
@@ -510,10 +556,15 @@ def play(args):
     payload_text, ckpt, mode_, seed = args[:4]
     opp_ckpt = args[4] if len(args) > 4 else ""
     delay = args[5] if len(args) > 5 else 0
+    deck_config_path = args[10] if len(args) > 10 else DEFAULT_DECK_CONFIG
+    target_config = load_deck_config(deck_config_path)
     royalesim, names, ids, cat = RR._setup()
     sub = royalesim.SUBTILE_PER_MILLITILE
     p = json.loads(payload_text)
     battle = p["battle"]
+    target_seat = target_config.target_seat(battle)
+    if target_seat is None:
+        return None
     decks, forms, levels = [], [], []
     for side in ("team", "opponent"):
         deck, form, level = [], [], []
@@ -525,10 +576,14 @@ def play(args):
         decks.append(deck)
         forms.append(form)
         levels.append(level)
-    events = sorted((e for e in p["events"] if e["kind"] == "play_card"),
+    buttons = [ability_buttons(decks[s], forms[s], cat) for s in (0, 1)]
+    events = sorted((e for e in p["events"]
+                     if e["kind"] in ("play_card", "activate_ability")),
                     key=lambda e: (e["replay_tick_20hz"], e["source_index"]))
     plays = {0: [], 1: []}
     for e in events:
+        if e["kind"] != "play_card":
+            continue
         seat = 0 if e["side"] == "team" else 1
         u = e["coordinates"]["native_world_units"]
         plays[seat].append((int(e["replay_tick_20hz"]), names[base_key(e["card_key"])[0]],
@@ -537,8 +592,7 @@ def play(args):
     team_seat = 0 if ys[len(ys) // 2] < 16_000 else 1
     rs = {0: team_seat, 1: 1 - team_seat}
     seat_of = {rs[0]: 0, rs[1]: 1}
-    hog_seat = 0 if frozenset(decks[0]) == RR.HOG26 else 1
-    hog_team = rs[hog_seat]
+    target_team = rs[target_seat]
     dealt = []
     for seat in (0, 1):
         order = deal_order(decks[seat], [c for _, c, _, _ in plays[seat]])
@@ -571,25 +625,42 @@ def play(args):
     use_shadow = args[8] if len(args) > 8 else False
     if agent is not None and use_shadow:
         from rs_shadow import Shadow
-        prim, _ = _spawn_tables()
-        me_seat = seat_of[hog_team]
-        agent.shadow = Shadow(royalesim, cat, hog_team,
+        prim, _ = _spawn_tables(royalesim)
+        me_seat = seat_of[target_team]
+        agent.shadow = Shadow(royalesim, cat, target_team,
                               [ids[c] for c in dealt[me_seat]],
-                              [levels[me_seat][i] for i in perm[me_seat]], tower, prim)
+                              [levels[me_seat][i] for i in perm[me_seat]], tower, prim,
+                              my_forms=[forms[me_seat][i] for i in perm[me_seat]])
     if agent is not None:
         agent.lead = abs(lead) % 1000
         agent.lead_rebuild = -1000 < lead < 0
         agent.lead_extrapolate = lead >= 1000
         agent.hold_pending = hold
         agent.spell_aim = spell_aim
-    ghost_team = 1 - hog_team
+    ghost_team = 1 - target_team
     opponent = RSAgent(opp_ckpt, seed=seed + 7) if opp_ckpt else None
-    scripted = [(t, rs[s], c, x, y) for s in (0, 1) for (t, c, x, y) in plays[s]
-                if (mode_ == "pro" or rs[s] == ghost_team) and not
-                (opponent is not None and rs[s] == ghost_team)]
+    scripted = []
+    for event in events:
+        seat = 0 if event["side"] == "team" else 1
+        team = rs[seat]
+        if not ((mode_ == "pro" or team == ghost_team)
+                and not (opponent is not None and team == ghost_team)):
+            continue
+        tick_e = int(event["replay_tick_20hz"])
+        source = int(event.get("source_index", 0))
+        if event["kind"] == "activate_ability":
+            button = ability_button_for_event(event, buttons[seat], names)
+            if button is not None:
+                scripted.append((tick_e, source, team, "ability", button, 0, 0))
+        else:
+            u = event["coordinates"]["native_world_units"]
+            card = names[base_key(event["card_key"])[0]]
+            scripted.append((tick_e, source, team, "play", card,
+                             int(u["x"]), int(u["y"])))
     if delay:
-        scripted = [(max(0, t - delay), team, c, x, y) for (t, team, c, x, y) in scripted]
-    scripted.sort()
+        scripted = [(max(0, t - delay), source, team, kind, action, x, y)
+                    for (t, source, team, kind, action, x, y) in scripted]
+    scripted.sort(key=lambda row: (row[0], row[1]))
     mem = {"seen": {0: set(), 1: set()}, "last": {0: [], 1: []}}
     i, tick, n_agent = 0, 0, 0
     while tick < 6200:
@@ -598,8 +669,12 @@ def play(args):
             break
         cmds = []
         while i < len(scripted) and scripted[i][0] <= tick:
-            _, team, card, x, y = scripted[i]
+            _, _, team, kind, action, x, y = scripted[i]
             i += 1
+            if kind == "ability":
+                cmds.append((team, 4 + int(action), 0, 0))
+                continue
+            card = action
             hand = state["players"][team]["hand"]
             cid = ids[card]
             if cid in hand:
@@ -611,25 +686,26 @@ def play(args):
         if agent is not None and getattr(agent, "shadow", None) is not None:
             agent.shadow.observe(state)
         if agent is not None and tick % DECIDE == 0 and tick >= 90:
-            cmd = agent.act(b, state, hog_team, mem, tick, sub, royalesim)
+            cmd = agent.act(b, state, target_team, mem, tick, sub, royalesim)
             if cmd is not None:
                 cmds.append(cmd)
-                agent.sent = getattr(agent, "sent", []) + [
-                    (tick + delay, state["players"][hog_team]["hand"][cmd[1]], cmd[2], cmd[3])]
-                if getattr(agent, "shadow", None) is not None:
-                    agent.shadow.own_play(tick + delay, state["players"][hog_team]["hand"][cmd[1]],
-                                          cmd[2], cmd[3])
-                card = state["players"][hog_team]["hand"][cmd[1]]
-                mem["seen"][hog_team].add(card + 2)
-                mem["last"][hog_team].append((card + 2, tick))
+                if cmd[1] < 4:
+                    card = state["players"][target_team]["hand"][cmd[1]]
+                    agent.sent = getattr(agent, "sent", []) + [
+                        (tick + delay, card, cmd[2], cmd[3])]
+                    if getattr(agent, "shadow", None) is not None:
+                        agent.shadow.own_play(tick + delay, card, cmd[2], cmd[3])
+                    mem["seen"][target_team].add(card + 2)
+                    mem["last"][target_team].append((card + 2, tick))
                 n_agent += 1
         if opponent is not None and tick % DECIDE == 0 and tick >= 90:
             cmd = opponent.act(b, state, ghost_team, mem, tick, sub, royalesim)
             if cmd is not None:
                 cmds.append(cmd)
-                card = state["players"][ghost_team]["hand"][cmd[1]]
-                mem["seen"][ghost_team].add(card + 2)
-                mem["last"][ghost_team].append((card + 2, tick))
+                if cmd[1] < 4:
+                    card = state["players"][ghost_team]["hand"][cmd[1]]
+                    mem["seen"][ghost_team].add(card + 2)
+                    mem["last"][ghost_team].append((card + 2, tick))
         nxt = scripted[i][0] if i < len(scripted) else 6000
         step = max(1, min(nxt, (tick // DECIDE + 1) * DECIDE) - tick)
         b.step(cmds, step)
@@ -637,16 +713,16 @@ def play(args):
     state = json.loads(b.state_json())
     w = state["winner"]
     real = str(battle.get("result", "")).lower()
-    real_hog = (("win" if real in ("victory", "win") else "loss" if real in ("defeat", "loss") else "draw")
-                if hog_seat == 0 else
-                ("loss" if real in ("victory", "win") else "win" if real in ("defeat", "loss") else "draw"))
-    return {"tag": p["source"]["replay_tag"], "mode": mode_, "real": real_hog,
+    real_target = (("win" if real in ("victory", "win") else "loss" if real in ("defeat", "loss") else "draw")
+                   if target_seat == 0 else
+                   ("loss" if real in ("victory", "win") else "win" if real in ("defeat", "loss") else "draw"))
+    return {"tag": p["source"]["replay_tag"], "mode": mode_, "real": real_target,
             "game_over": state["game_over"], "end_tick": state["tick"],
-            "result": "win" if w == hog_team else "loss" if w in (0, 1) else "draw",
-            "crowns": [state["players"][hog_team]["crowns"], state["players"][1 - hog_team]["crowns"]],
+            "result": "win" if w == target_team else "loss" if w in (0, 1) else "draw",
+            "crowns": [state["players"][target_team]["crowns"], state["players"][1 - target_team]["crowns"]],
             "agent_plays": n_agent,
             "records": getattr(agent, "records", None),
-            "hog_team": hog_team}
+            "target_team": target_team}
 
 
 def main() -> int:
@@ -673,9 +749,12 @@ def main() -> int:
     ap.add_argument("--opponent-ckpt", default="",
                     help="a reactive opponent: this checkpoint plays the recorded opponent's "
                          "deck instead of the ghost replaying its commands")
+    ap.add_argument("--deck-config", type=Path, default=DEFAULT_DECK_CONFIG,
+                    help="target deck JSON (cards and evolution/hero forms)")
     args = ap.parse_args()
     import pyarrow.parquet as pq
     royalesim, names, ids, cat = RR._setup()
+    target_config = load_deck_config(args.deck_config)
     picked = []
     for part in sorted((CORPUS / "replays").glob("part-*.parquet")):
         acts = None
@@ -683,12 +762,7 @@ def main() -> int:
             if r["game_mode"] not in RR.MODES or RR.split_of(r["replay_tag"]) != "test":
                 continue
             p = json.loads(r["payload_json"])
-            try:
-                sides = [frozenset(names.get(base_key(c["card_key"])[0])
-                                   for c in p["battle"][s]["players"][0]["deck"]) for s in ("team", "opponent")]
-            except (KeyError, IndexError):
-                continue
-            if any(None in s for s in sides) or RR.HOG26 not in sides or sides[0] == sides[1]:
+            if target_config.target_seat(p.get("battle", {})) is None:
                 continue
             p.setdefault("source", {})["replay_tag"] = r["replay_tag"]
             picked.append(json.dumps(p))
@@ -698,10 +772,16 @@ def main() -> int:
             break
     mode_ = ("pro" if args.pro else "search_rebuild" if args.search and args.rebuild
              else "search" if args.search else "agent")
+    if not picked:
+        raise SystemExit(
+            f"no held-out test matches found for {target_config.label}; "
+            "download the complete replay corpus and check the exact deck/forms")
+    print(f"selected {len(picked)} held-out {target_config.label} matches", flush=True)
     t0 = time.time()
     with ProcessPoolExecutor(args.workers) as pool:
         rows = [r for r in pool.map(play, [(t, args.ckpt, mode_, k, args.opponent_ckpt, args.delay, args.lead,
-                                        args.hold_pending, args.shadow, args.spell_aim)
+                                        args.hold_pending, args.shadow, args.spell_aim,
+                                        str(target_config.source))
                                        for k, t in enumerate(picked)])
                 if r]
     wins = sum(r["result"] == "win" for r in rows)
@@ -718,7 +798,7 @@ def main() -> int:
             + (" spell-aim" if args.spell_aim else "")
             + (f" vs reactive {Path(args.opponent_ckpt).parent.name}" if args.opponent_ckpt else " vs ghost"))
     real_w = sum(r["real"] == "win" for r in rows)
-    print(f"  real result of the Hog player in these matches: {real_w}/{len(rows)} "
+    print(f"  real result of the {target_config.label} player in these matches: {real_w}/{len(rows)} "
           f"({real_w / max(1, len(rows)):.1%}); unfinished in engine: "
           f"{sum(not r['game_over'] for r in rows)}")
     print(f"{name}: {wins}/{len(rows)} wins ({wins / max(1, len(rows)):.1%}, 95% [{lo:.1%}, {hi:.1%}]) "

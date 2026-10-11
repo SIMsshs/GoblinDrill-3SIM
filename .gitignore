@@ -85,5 +85,6 @@ data/replays_xy/
 data/il_rows/
 data/rs_rows/
 .venvs/
+data/rs_rows_*/
 data/rs_rows_live60/
 runs/tokens/
