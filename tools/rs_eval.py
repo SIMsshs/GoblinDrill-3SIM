@@ -56,6 +56,28 @@ def to_world(ox, oy, team):
     return (ox, 32_000 - oy) if team == 0 else (18_000 - ox, oy)
 
 
+def unsupported_deck_cards(battle, names):
+    """Replay card keys that the installed RoyaleSim cannot simulate."""
+    missing = set()
+    for side in ("team", "opponent"):
+        players = battle.get(side, {}).get("players", [])
+        if len(players) != 1:
+            return {"<non-1v1>"}
+        for card in players[0].get("deck", []):
+            key = base_key(card["card_key"])[0]
+            if names.get(key) is None:
+                missing.add(key)
+    return missing
+
+
+def next_wakeup_tick(tick, scripted_tick, opponent_decide=None):
+    """Next simulator tick needed by a script or either live policy."""
+    wakeups = [scripted_tick, (tick // DECIDE + 1) * DECIDE]
+    if opponent_decide is not None:
+        wakeups.append((tick // opponent_decide + 1) * opponent_decide)
+    return min(wakeups)
+
+
 class RSAgent:
     lead = 0      # ticks to look ahead before deciding (delay compensation)
 
@@ -145,7 +167,8 @@ class RSAgent:
             # stop to attack overshoot, new units are not predicted.
             F = RR.F
             prev = getattr(self, "_prev", {})
-            dt = max(1, state["tick"] - getattr(self, "_prev_tick", state["tick"] - DECIDE))
+            dt = max(1, state["tick"] - getattr(
+                self, "_prev_tick", state["tick"] - self.decide_ticks))
             future = json.loads(json.dumps(state))
             for e in future["entities"]:
                 uid = e[F["uid"]]
@@ -305,6 +328,7 @@ class RSAgent:
             except (KeyError, ValueError):
                 pass
         self.wait_bias = math.log(1 / wait_keep)
+        self.decide_ticks = DECIDE
 
     def batch(self, row):
         t = self.torch
@@ -359,7 +383,8 @@ class RSAgent:
         self.mask_gate(g, battle, state, team)
         pr = np.exp(g - g.max())
         pr /= pr.sum()
-        if self.rng.random() < float(pr[0]) ** (DECIDE / 20) or g[1:].max() < -1e8:
+        if (self.rng.random() < float(pr[0]) ** (self.decide_ticks / 20)
+                or g[1:].max() < -1e8):
             return None
         action = 1 + int(np.argmax(g[1:]))
         if action >= 5:
@@ -449,7 +474,8 @@ class RSSearchAgent(RSAgent):
         self.mask_gate(g, battle, state, team)
         pr = np.exp(g - g.max())
         pr /= pr.sum()
-        if self.rng.random() < float(pr[0]) ** (DECIDE / 20) or g[1:].max() < -1e8:
+        if (self.rng.random() < float(pr[0]) ** (self.decide_ticks / 20)
+                or g[1:].max() < -1e8):
             return None
         action = 1 + int(np.argmax(g[1:]))
         # Ability presses have no placement tile. Their learned gate decision
@@ -557,6 +583,8 @@ def play(args):
     opp_ckpt = args[4] if len(args) > 4 else ""
     delay = args[5] if len(args) > 5 else 0
     deck_config_path = args[10] if len(args) > 10 else DEFAULT_DECK_CONFIG
+    shuffle = bool(args[11]) if len(args) > 11 else False
+    opponent_decide = max(1, int(args[12])) if len(args) > 12 else DECIDE
     target_config = load_deck_config(deck_config_path)
     royalesim, names, ids, cat = RR._setup()
     sub = royalesim.SUBTILE_PER_MILLITILE
@@ -564,6 +592,10 @@ def play(args):
     battle = p["battle"]
     target_seat = target_config.target_seat(battle)
     if target_seat is None:
+        return None
+    # Be defensive when play() is called directly (self-play does this): an
+    # unsupported opponent card must skip one match, not kill the worker pool.
+    if unsupported_deck_cards(battle, names):
         return None
     decks, forms, levels = [], [], []
     for side in ("team", "opponent"):
@@ -595,7 +627,11 @@ def play(args):
     target_team = rs[target_seat]
     dealt = []
     for seat in (0, 1):
-        order = deal_order(decks[seat], [c for _, c, _, _ in plays[seat]])
+        # Held-out replay comparisons reconstruct the recorded hand order.
+        # Reactive self-play instead asks RoyaleSim to shuffle both decks, so
+        # the policy cannot memorize one starting hand for a replay tag.
+        order = (list(decks[seat]) if shuffle else
+                 deal_order(decks[seat], [c for _, c, _, _ in plays[seat]]))
         if order is None:
             return None
         dealt.append(order)
@@ -611,7 +647,7 @@ def play(args):
         # back identical, match for match, to an undelayed one).
         b.set_command_delay_ticks(delay, delay)
     b.reset(seed=seed, decks=[[ids[c] for c in dealt[seat_of[t]]] for t in (0, 1)],
-            shuffle=0, start_tick=0, elixir_milli=[6000, 6000], tower_hp=None, spawns=[],
+            shuffle=int(shuffle), start_tick=0, elixir_milli=[6000, 6000], tower_hp=None, spawns=[],
             forms=[[forms[seat_of[t]][i] for i in perm[seat_of[t]]] for t in (0, 1)],
             levels=[[levels[seat_of[t]][i] for i in perm[seat_of[t]]] for t in (0, 1)],
             tower_levels=[tower, tower])
@@ -639,6 +675,16 @@ def play(args):
         agent.spell_aim = spell_aim
     ghost_team = 1 - target_team
     opponent = RSAgent(opp_ckpt, seed=seed + 7) if opp_ckpt else None
+    if opponent is not None:
+        # A reactive opponent must obey the same public-observation and delay
+        # contract as the policy under test.  Previously it saw the exact
+        # current engine state while only the target rebuilt a public future.
+        opponent.lead = abs(lead) % 1000
+        opponent.lead_rebuild = -1000 < lead < 0
+        opponent.lead_extrapolate = lead >= 1000
+        opponent.hold_pending = hold
+        opponent.spell_aim = spell_aim
+        opponent.decide_ticks = opponent_decide
     scripted = []
     for event in events:
         seat = 0 if event["side"] == "team" else 1
@@ -698,20 +744,33 @@ def play(args):
                     mem["seen"][target_team].add(card + 2)
                     mem["last"][target_team].append((card + 2, tick))
                 n_agent += 1
-        if opponent is not None and tick % DECIDE == 0 and tick >= 90:
+        if opponent is not None and tick % opponent_decide == 0 and tick >= 90:
             cmd = opponent.act(b, state, ghost_team, mem, tick, sub, royalesim)
             if cmd is not None:
                 cmds.append(cmd)
                 if cmd[1] < 4:
                     card = state["players"][ghost_team]["hand"][cmd[1]]
+                    opponent.sent = getattr(opponent, "sent", []) + [
+                        (tick + delay, card, cmd[2], cmd[3])]
                     mem["seen"][ghost_team].add(card + 2)
                     mem["last"][ghost_team].append((card + 2, tick))
         nxt = scripted[i][0] if i < len(scripted) else 6000
-        step = max(1, min(nxt, (tick // DECIDE + 1) * DECIDE) - tick)
+        cadence = None
+        if opponent is not None:
+            # Curriculum cadences such as 19 or 18 ticks are not necessarily
+            # multiples of the target agent's 10-tick cadence.  Stop at both
+            # clocks or the modulo check above would miss most opponent turns.
+            cadence = opponent_decide
+        step = max(1, next_wakeup_tick(tick, nxt, cadence) - tick)
         b.step(cmds, step)
         tick += step
     state = json.loads(b.state_json())
     w = state["winner"]
+    tower_fraction = []
+    for team in (target_team, 1 - target_team):
+        hp = state["players"][team]["tower_hp"]
+        mx = state["players"][team]["tower_max_hp"]
+        tower_fraction.append(sum(float(h) / max(1, float(m)) for h, m in zip(hp, mx)))
     real = str(battle.get("result", "")).lower()
     real_target = (("win" if real in ("victory", "win") else "loss" if real in ("defeat", "loss") else "draw")
                    if target_seat == 0 else
@@ -720,6 +779,7 @@ def play(args):
             "game_over": state["game_over"], "end_tick": state["tick"],
             "result": "win" if w == target_team else "loss" if w in (0, 1) else "draw",
             "crowns": [state["players"][target_team]["crowns"], state["players"][1 - target_team]["crowns"]],
+            "tower_fraction": tower_fraction,
             "agent_plays": n_agent,
             "records": getattr(agent, "records", None),
             "target_team": target_team}
@@ -751,11 +811,15 @@ def main() -> int:
                          "deck instead of the ghost replaying its commands")
     ap.add_argument("--deck-config", type=Path, default=DEFAULT_DECK_CONFIG,
                     help="target deck JSON (cards and evolution/hero forms)")
+    ap.add_argument("--json", action="store_true",
+                    help="also print a machine-readable summary as the last line")
     args = ap.parse_args()
     import pyarrow.parquet as pq
     royalesim, names, ids, cat = RR._setup()
     target_config = load_deck_config(args.deck_config)
     picked = []
+    skipped_unsupported = 0
+    unsupported = Counter()
     for part in sorted((CORPUS / "replays").glob("part-*.parquet")):
         acts = None
         for r in pq.read_table(part, columns=["replay_tag", "game_mode", "payload_json"]).to_pylist():
@@ -763,6 +827,11 @@ def main() -> int:
                 continue
             p = json.loads(r["payload_json"])
             if target_config.target_seat(p.get("battle", {})) is None:
+                continue
+            missing = unsupported_deck_cards(p["battle"], names)
+            if missing:
+                skipped_unsupported += 1
+                unsupported.update(missing)
                 continue
             p.setdefault("source", {})["replay_tag"] = r["replay_tag"]
             picked.append(json.dumps(p))
@@ -776,6 +845,10 @@ def main() -> int:
         raise SystemExit(
             f"no held-out test matches found for {target_config.label}; "
             "download the complete replay corpus and check the exact deck/forms")
+    if skipped_unsupported:
+        details = ", ".join(f"{card} ({count})" for card, count in unsupported.most_common())
+        print(f"skipped {skipped_unsupported} held-out matches with unsupported "
+              f"RoyaleSim cards: {details}", flush=True)
     print(f"selected {len(picked)} held-out {target_config.label} matches", flush=True)
     t0 = time.time()
     with ProcessPoolExecutor(args.workers) as pool:
@@ -801,14 +874,27 @@ def main() -> int:
     print(f"  real result of the {target_config.label} player in these matches: {real_w}/{len(rows)} "
           f"({real_w / max(1, len(rows)):.1%}); unfinished in engine: "
           f"{sum(not r['game_over'] for r in rows)}")
+    elapsed = time.time() - t0
+    plays_per_match = sum(r["agent_plays"] for r in rows) / max(1, len(rows))
     print(f"{name}: {wins}/{len(rows)} wins ({wins / max(1, len(rows)):.1%}, 95% [{lo:.1%}, {hi:.1%}]) "
           f"{draws} draws, crown diff {cd:+.2f}, agent plays/match "
-          f"{sum(r['agent_plays'] for r in rows) / max(1, len(rows)):.1f} ({time.time() - t0:.0f}s)")
+          f"{plays_per_match:.1f} ({elapsed:.0f}s)")
+    summary = {"name": name, "ckpt": args.ckpt, "wins": wins, "draws": draws,
+               "n": len(rows), "win_rate": wins / max(1, len(rows)),
+               "result_score": (wins + 0.5 * draws) / max(1, len(rows)),
+               "ci": [lo, hi], "crown_diff": cd,
+               "agent_plays_per_match": plays_per_match,
+               "seconds": round(elapsed, 1)}
     out = ROOT / "reports" / "rs_ghost.jsonl"
-    with out.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"name": name, "ckpt": args.ckpt, "wins": wins, "n": len(rows),
-                            "ci": [lo, hi], "crown_diff": cd,
-                            "rows": rows}) + "\n")
+    try:
+        with out.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({**summary, "rows": rows}) + "\n")
+    except OSError as exc:
+        # The summary is the training-critical result; the detailed report is
+        # only an audit trail and must not prevent best-checkpoint selection.
+        print(f"warning: could not append {out}: {exc}", file=sys.stderr, flush=True)
+    if args.json:
+        print(json.dumps(summary), flush=True)
     return 0
 
 

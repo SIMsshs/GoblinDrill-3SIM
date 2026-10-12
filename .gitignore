@@ -88,3 +88,5 @@ data/rs_rows/
 data/rs_rows_*/
 data/rs_rows_live60/
 runs/tokens/
+runs/selfplay/
+reports/rs_ghost.jsonl

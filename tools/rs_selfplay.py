@@ -23,10 +23,11 @@ among the legal ones. Here the slot and tile are SAMPLED (the evaluator takes
 the argmax), so the policy can find out what else works; that is what the
 log-probabilities below describe.
 
-Update: PPO (clipped ratio) on advantage = result - value, where result is
-1 / 0.5 / 0 for win / draw / loss and value is the model's own win head at that
-moment, plus a KL penalty to the imitation model so it cannot wander off into
-play no pro would recognise. The value head is trained on the results too.
+Update: PPO uses an objective-aligned terminal return: win/draw/loss remains
+the dominant signal, with small crown and remaining-tower terms so an initial
+policy that loses every hard match can still distinguish a close loss from a
+three-crown collapse.  A curriculum mixes recorded ghosts with progressively
+faster reactive opponents, while a KL penalty keeps the policy near imitation.
 
 Nothing here touches the emulator or the game.
 """
@@ -58,6 +59,47 @@ TILE_TEMP = 1.0
 # 16 legal tiles, so all 8 were bridge tiles - and what is never tried cannot
 # be learned (2026-10-10).
 CANDS = TOP_TILES + EXTRA_TILES
+
+
+def linear_schedule(start: float, end: float, iteration: int, steps: int) -> float:
+    """Inclusive linear curriculum: iteration 0 is start, steps-1 is end."""
+    if steps <= 1:
+        return float(end)
+    progress = min(1.0, max(0.0, iteration / (steps - 1)))
+    return float(start + (end - start) * progress)
+
+
+def shaped_return(result: str, crowns, tower_fraction, terminal_weight: float = 0.7,
+                  crown_weight: float = 0.1, tower_weight: float = 0.2):
+    """Return a bounded, game-objective reward and its auditable components.
+
+    Crown and tower terms are deliberately subordinate to the terminal result:
+    with the defaults, any win still outranks any draw and any draw outranks any
+    loss.  They only rank outcomes inside those broad result classes.
+    """
+    weights = np.asarray([terminal_weight, crown_weight, tower_weight], dtype=float)
+    if (weights < 0).any() or weights.sum() <= 0:
+        raise ValueError("reward weights must be non-negative with a positive sum")
+    if terminal_weight <= 2 * (crown_weight + tower_weight):
+        raise ValueError(
+            "terminal weight must exceed twice the crown and tower weights combined "
+            "so every win outranks every draw and every draw outranks every loss")
+    weights /= weights.sum()
+    terminal = {"win": 1.0, "draw": 0.5, "loss": 0.0}[result]
+    crown_diff = float(crowns[0]) - float(crowns[1])
+    tower_diff = float(tower_fraction[0]) - float(tower_fraction[1])
+    crown_score = float(np.clip(0.5 + crown_diff / 6.0, 0.0, 1.0))
+    tower_score = float(np.clip(0.5 + tower_diff / 6.0, 0.0, 1.0))
+    reward = float(weights @ np.asarray([terminal, crown_score, tower_score]))
+    return reward, {"terminal": terminal, "crown": crown_score, "tower": tower_score,
+                    "crown_diff": crown_diff, "tower_diff": tower_diff}
+
+
+def evaluation_score(summary):
+    """Lexicographic checkpoint rank: game result first, crown margin second."""
+    n = max(1, int(summary.get("n", 0)))
+    result = (float(summary.get("wins", 0)) + 0.5 * float(summary.get("draws", 0))) / n
+    return result, float(summary.get("crown_diff", -999.0))
 
 
 # ----------------------------------------------------------------------------
@@ -178,23 +220,32 @@ def _collect_one(task):
     out = rs_eval.play(task)
     if not out or not out.get("records"):
         return None
-    r = {"win": 1.0, "draw": 0.5, "loss": 0.0}[out["result"]]
-    return out["result"], out["crowns"], r, out["records"]
+    weights = task[13:16] if len(task) >= 16 else (0.7, 0.1, 0.2)
+    reward, components = shaped_return(out["result"], out["crowns"],
+                                       out["tower_fraction"], *weights)
+    source = json.loads(task[0]).get("source", {})
+    kind = ("reactive_general" if source.get("synthetic_opponent") else
+            "reactive_replay" if task[4] else "ghost")
+    return {"outcome": out["result"], "crowns": out["crowns"], "reward": reward,
+            "components": components, "records": out["records"], "kind": kind}
 
 
-def pick_matches(n, seed, split="train", deck_config=None):
-    """Target-deck matches from IL_Replay, shuffled by seed."""
+def pick_matches(n, seed, split="train", deck_config=None, general_opponents=0):
+    """Target-deck templates, optionally given supported general opponent decks."""
     import random
     import pyarrow.parquet as pq
+    import rs_eval
     import rs_rows as RR
     from sim.deck_config import load_deck_config
-    from royalesim_redrive import CORPUS, base_key
+    from royalesim_redrive import CORPUS
     _, names, _, _ = RR._setup()
     target = load_deck_config(deck_config)
     parts = sorted((CORPUS / "replays").glob("part-*.parquet"))
     rnd = random.Random(seed)
     rnd.shuffle(parts)
     picked = []
+    opponent_decks = []
+    seen_decks = set()
     for part in parts:
         rows = pq.read_table(part, columns=["replay_tag", "game_mode", "payload_json"]).to_pylist()
         rnd.shuffle(rows)
@@ -202,31 +253,75 @@ def pick_matches(n, seed, split="train", deck_config=None):
             if r["game_mode"] not in RR.MODES or RR.split_of(r["replay_tag"]) != split:
                 continue
             p = json.loads(r["payload_json"])
-            if target.target_seat(p.get("battle", {})) is None:
+            battle = p.get("battle", {})
+            if rs_eval.unsupported_deck_cards(battle, names):
                 continue
-            p.setdefault("source", {})["replay_tag"] = r["replay_tag"]
-            picked.append(json.dumps(p))
-            if len(picked) >= n:
-                return picked
-    return picked
+            target_seat = target.target_seat(battle)
+            if target_seat is not None and len(picked) < n:
+                p.setdefault("source", {})["replay_tag"] = r["replay_tag"]
+                picked.append(p)
+            elif len(opponent_decks) < general_opponents:
+                sides = ["team", "opponent"]
+                rnd.shuffle(sides)
+                for side in sides:
+                    deck = battle[side]["players"][0]["deck"]
+                    signature = tuple(sorted(str(card.get("card_key") or "") for card in deck))
+                    if (len(deck) == 8 and signature not in seen_decks
+                            and not target.matches_replay_cards(deck)):
+                        seen_decks.add(signature)
+                        opponent_decks.append(json.loads(json.dumps(deck)))
+                        break
+            if len(picked) >= n and len(opponent_decks) >= general_opponents:
+                break
+        if len(picked) >= n and len(opponent_decks) >= general_opponents:
+            break
+
+    replace_n = min(general_opponents, len(picked), len(opponent_decks))
+    for index, deck in zip(rnd.sample(range(len(picked)), replace_n), opponent_decks[:replace_n]):
+        p = picked[index]
+        seat = target.target_seat(p["battle"])
+        other = "opponent" if seat == 0 else "team"
+        p["battle"][other]["players"][0]["deck"] = deck
+        p.setdefault("source", {})["synthetic_opponent"] = True
+    return [json.dumps(p) for p in picked]
 
 
 def collect(args):
     from concurrent.futures import ProcessPoolExecutor
-    picked = pick_matches(args.matches, args.seed, deck_config=args.deck_config)
-    tasks = [(t, args.ckpt, "agent", args.seed * 1000 + k, args.opponent, 21, -21,
-              False, False, False, str(args.deck_config))
-             for k, t in enumerate(picked)]
+    import random
+    # Validate once in the parent process so a bad custom reward configuration
+    # produces a direct explanation instead of a remote worker traceback.
+    shaped_return("draw", [0, 0], [3.0, 3.0], args.terminal_weight,
+                  args.crown_weight, args.tower_weight)
+    reactive_rate = min(1.0, max(0.0, float(args.reactive_rate)))
+    desired_reactive = int(round(args.matches * reactive_rate))
+    desired_general = int(round(desired_reactive * min(1.0, max(0.0, args.general_opponent_rate))))
+    picked = pick_matches(args.matches, args.seed, deck_config=args.deck_config,
+                          general_opponents=desired_general)
+    synthetic = [bool(json.loads(text).get("source", {}).get("synthetic_opponent"))
+                 for text in picked]
+    reactive = {i for i, value in enumerate(synthetic) if value}
+    candidates = [i for i in range(len(picked)) if i not in reactive]
+    rng = random.Random(args.seed + 9173)
+    rng.shuffle(candidates)
+    reactive.update(candidates[:max(0, min(len(picked), desired_reactive) - len(reactive))])
+    tasks = []
+    for k, text in enumerate(picked):
+        is_reactive = k in reactive
+        tasks.append((text, args.ckpt, "agent", args.seed * 1000 + k,
+                      args.opponent if is_reactive else "", 21, -21,
+                      False, False, False, str(args.deck_config),
+                      bool(args.randomize_reactive and is_reactive), args.opponent_decide,
+                      args.terminal_weight, args.crown_weight, args.tower_weight))
     t0 = time.time()
     recs, results = [], []
     with ProcessPoolExecutor(args.workers) as pool:
         for res in pool.map(_collect_one, tasks):
             if res is None:
                 continue
-            outcome, crowns, r, rows = res
-            results.append(outcome)
-            for row in rows:
-                row["ret"] = r
+            results.append(res)
+            for row in res["records"]:
+                row["ret"] = res["reward"]
                 recs.append(row)
     if not recs:
         raise RuntimeError(
@@ -234,9 +329,27 @@ def collect(args):
             "check the exact deck/forms in --deck-config, and verify the checkpoint")
     out = {k: np.stack([x[k] for x in recs]) for k in recs[0]}
     np.savez_compressed(args.out, **out)
-    w = results.count("win") / max(1, len(results))
-    print(json.dumps({"matches": len(results), "decisions": len(recs), "win_rate": round(w, 3),
-                      "seconds": round(time.time() - t0)}), flush=True)
+    def group(kind):
+        return [r for r in results if r["kind"] == kind]
+
+    def rate(rows):
+        return sum(r["outcome"] == "win" for r in rows) / max(1, len(rows))
+
+    rewards = np.asarray([r["reward"] for r in results], dtype=float)
+    row = {"matches": len(results), "decisions": len(recs),
+           "win_rate": round(rate(results), 3),
+           "mean_reward": round(float(rewards.mean()), 4),
+           "reward_std": round(float(rewards.std()), 4),
+           "mean_crown_diff": round(float(np.mean([r["components"]["crown_diff"]
+                                                    for r in results])), 3),
+           "mean_tower_diff": round(float(np.mean([r["components"]["tower_diff"]
+                                                    for r in results])), 3),
+           "seconds": round(time.time() - t0)}
+    for kind in ("ghost", "reactive_replay", "reactive_general"):
+        rows = group(kind)
+        row[f"{kind}_matches"] = len(rows)
+        row[f"{kind}_win_rate"] = round(rate(rows), 3) if rows else None
+    print(json.dumps(row), flush=True)
 
 
 # ----------------------------------------------------------------------------
@@ -248,6 +361,8 @@ def train(args):
     import torch.nn.functional as F
     from sim.model_tokens import TokenPolicy
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     def load(path):
         blob = torch.load(path, map_location="cpu")
@@ -355,28 +470,62 @@ def train(args):
 def loop(args):
     run = RUNS / args.name
     run.mkdir(parents=True, exist_ok=True)
-    (run / "args.json").write_text(json.dumps(vars(args), default=str))
     rg = Path(sys.executable)
     bb = Path(args.train_python) if args.train_python else rg
     me = str(Path(__file__).resolve())
     # args.json next to each checkpoint so RSAgent reads the right wait_keep
     init_args = Path(args.ref or args.init).with_name("args.json")
     wait_keep = json.loads(init_args.read_text())["wait_keep"] if init_args.exists() else "0.25"
+    saved_args = {**vars(args), "wait_keep": wait_keep, "schema_version": 3}
+    args_path = run / "args.json"
+    existing = sorted(run.glob("it*.pt"))
+    if args_path.exists() and existing:
+        old = json.loads(args_path.read_text())
+        if old.get("schema_version") != 3:
+            raise SystemExit("self-play run uses an older training format; "
+                             "choose a new --name")
+        allowed_to_change = {"iters", "workers", "eval_every", "eval_matches"}
+        changed = []
+        for key, value in saved_args.items():
+            if key in allowed_to_change or key not in old:
+                continue
+            if str(old[key]) != str(value):
+                changed.append(f"{key}: {old[key]!r} -> {value!r}")
+        if changed:
+            raise SystemExit("self-play run already exists with incompatible settings; "
+                             "choose a new --name\n  " + "\n  ".join(changed))
     ckpt = run / "it000.pt"
     if not ckpt.exists():
         import shutil
         shutil.copy(args.init, ckpt)
-    (run / "args.json").write_text(json.dumps({**vars(args), "wait_keep": wait_keep}, default=str))
+    args_path.write_text(json.dumps(saved_args, default=str))
     log = run / "log.jsonl"
     start = max([int(p.stem[2:]) for p in run.glob("it*.pt")])
+    if start >= args.iters:
+        print(json.dumps({"status": "already_complete", "iterations": start,
+                          "run": str(run)}), flush=True)
+        return 0
     for it in range(start, args.iters):
         ckpt = run / f"it{it:03d}.pt"
         data = run / f"it{it:03d}.npz"
         t0 = time.time()
+        reactive_rate = linear_schedule(args.reactive_start, args.reactive_end, it,
+                                        args.curriculum_iters)
+        opponent_decide = max(1, int(round(linear_schedule(
+            args.opponent_decide_start, args.opponent_decide_end, it,
+            args.curriculum_iters))))
         c = subprocess.run([str(rg), me, "collect", "--ckpt", str(ckpt), "--opponent", args.opponent,
                             "--matches", str(args.matches), "--workers", str(args.workers),
                             "--seed", str(it + 1), "--out", str(data),
-                            "--deck-config", str(args.deck_config)],
+                            "--deck-config", str(args.deck_config),
+                            "--reactive-rate", str(reactive_rate),
+                            "--general-opponent-rate", str(args.general_opponent_rate),
+                            "--opponent-decide", str(opponent_decide),
+                            "--terminal-weight", str(args.terminal_weight),
+                            "--crown-weight", str(args.crown_weight),
+                            "--tower-weight", str(args.tower_weight),
+                            ("--randomize-reactive" if args.randomize_reactive
+                             else "--no-randomize-reactive")],
                            capture_output=True, text=True)
         if c.returncode != 0:
             print(c.stderr[-2000:], flush=True)
@@ -385,23 +534,44 @@ def loop(args):
         nxt = run / f"it{it + 1:03d}.pt"
         t = subprocess.run([str(bb), me, "train", "--ckpt", str(ckpt), "--ref", args.ref or args.init,
                             "--data", str(data), "--out", str(nxt), "--lr", str(args.lr),
-                            "--kl", str(args.kl), "--wait-keep", str(wait_keep)],
+                            "--kl", str(args.kl), "--wait-keep", str(wait_keep),
+                            "--seed", str(it + 1)],
                            capture_output=True, text=True)
         if t.returncode != 0:
             print(t.stderr[-2000:], flush=True)
             return 1
         tr = json.loads(t.stdout.strip().splitlines()[-1])
         data.unlink(missing_ok=True)                    # rollouts are cheap to regenerate
-        rec = {"iter": it, **{f"collect_{k}": v for k, v in col.items()}, **tr,
-               "seconds": round(time.time() - t0)}
+        rec = {"iter": it, "reactive_rate": round(reactive_rate, 4),
+               "opponent_decide": opponent_decide,
+               **{f"collect_{k}": v for k, v in col.items()}, **tr}
         if args.eval_every and (it + 1) % args.eval_every == 0:
             e = subprocess.run([str(rg), str(ROOT / "tools" / "rs_eval.py"), "--ckpt", str(nxt),
                                 "--opponent-ckpt", args.eval_opponent, "--matches", str(args.eval_matches),
                                 "--workers", str(args.workers), "--delay", "21", "--lead", "-21",
-                                "--deck-config", str(args.deck_config)],
+                                "--deck-config", str(args.deck_config), "--json"],
                                capture_output=True, text=True)
-            line = [l for l in e.stdout.splitlines() if " wins (" in l]
-            rec["eval"] = line[-1] if line else e.stderr[-300:]
+            if e.returncode:
+                rec["eval_error"] = e.stderr[-500:]
+            else:
+                try:
+                    summary = json.loads(e.stdout.strip().splitlines()[-1])
+                except (IndexError, json.JSONDecodeError):
+                    rec["eval_error"] = "evaluation returned no JSON summary"
+                else:
+                    rec["eval"] = summary
+                    score = evaluation_score(summary)
+                    best_meta = run / "best.json"
+                    previous = json.loads(best_meta.read_text()) if best_meta.exists() else None
+                    old_score = tuple(previous["score"]) if previous else (-1.0, -999.0)
+                    if score > old_score:
+                        import shutil
+                        shutil.copy2(nxt, run / "best.pt")
+                        best = {"checkpoint": nxt.name, "score": list(score),
+                                "evaluation": summary}
+                        best_meta.write_text(json.dumps(best, indent=2))
+                        rec["new_best"] = nxt.name
+        rec["seconds"] = round(time.time() - t0)
         with log.open("a") as fh:
             fh.write(json.dumps(rec) + "\n")
         print(json.dumps(rec), flush=True)
@@ -420,6 +590,16 @@ def main() -> int:
     c.add_argument("--out", required=True)
     c.add_argument("--deck-config", type=Path,
                    default=ROOT / "configs" / "decks" / "hog_26.json")
+    c.add_argument("--reactive-rate", type=float, default=0.25)
+    c.add_argument("--general-opponent-rate", type=float, default=0.5,
+                   help="share of reactive matches using decks from the general replay pool")
+    c.add_argument("--opponent-decide", type=int, default=20,
+                   help="reactive opponent decision interval in 20 Hz ticks")
+    c.add_argument("--randomize-reactive", action=argparse.BooleanOptionalAction, default=True,
+                   help="shuffle both starting decks in reactive matches")
+    c.add_argument("--terminal-weight", type=float, default=0.7)
+    c.add_argument("--crown-weight", type=float, default=0.1)
+    c.add_argument("--tower-weight", type=float, default=0.2)
     t = sp.add_parser("train")
     t.add_argument("--ckpt", required=True)
     t.add_argument("--ref", required=True)
@@ -431,6 +611,7 @@ def main() -> int:
     t.add_argument("--epochs", type=int, default=2)
     t.add_argument("--batch", type=int, default=256)
     t.add_argument("--wait-keep", default="0.25")
+    t.add_argument("--seed", type=int, default=0)
     lp = sp.add_parser("loop")
     lp.add_argument("--name", default="sp_v1")
     lp.add_argument("--init", default=str(ROOT / "runs" / "tokens" / "rs_big_hog" / "best.pt"))
@@ -444,6 +625,21 @@ def main() -> int:
     lp.add_argument("--workers", type=int, default=4)
     lp.add_argument("--lr", type=float, default=1e-5)
     lp.add_argument("--kl", type=float, default=0.05)
+    lp.add_argument("--reactive-start", type=float, default=0.25,
+                    help="reactive-opponent share at iteration zero")
+    lp.add_argument("--reactive-end", type=float, default=0.75,
+                    help="reactive-opponent share after the curriculum ramp")
+    lp.add_argument("--curriculum-iters", type=int, default=20)
+    lp.add_argument("--opponent-decide-start", type=int, default=20,
+                    help="initial reactive opponent cadence (20 ticks = 1 second)")
+    lp.add_argument("--opponent-decide-end", type=int, default=10,
+                    help="final reactive opponent cadence (10 ticks = 0.5 seconds)")
+    lp.add_argument("--general-opponent-rate", type=float, default=0.5,
+                    help="share of reactive matches drawing a deck from the general corpus")
+    lp.add_argument("--randomize-reactive", action=argparse.BooleanOptionalAction, default=True)
+    lp.add_argument("--terminal-weight", type=float, default=0.7)
+    lp.add_argument("--crown-weight", type=float, default=0.1)
+    lp.add_argument("--tower-weight", type=float, default=0.2)
     lp.add_argument("--eval-every", type=int, default=5)
     lp.add_argument("--eval-matches", type=int, default=300)
     lp.add_argument("--eval-opponent", default=str(ROOT / "runs" / "tokens" / "rs_bc" / "ep1.pt"),

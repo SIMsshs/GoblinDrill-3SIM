@@ -142,6 +142,15 @@ def selfplay(args) -> int:
         "--iters", args.iters, "--matches", args.matches,
         "--workers", args.workers, "--eval-every", args.eval_every,
         "--eval-matches", args.eval_matches, "--lr", args.lr, "--kl", args.kl,
+        "--reactive-start", args.reactive_start, "--reactive-end", args.reactive_end,
+        "--curriculum-iters", args.curriculum_iters,
+        "--opponent-decide-start", args.opponent_decide_start,
+        "--opponent-decide-end", args.opponent_decide_end,
+        "--general-opponent-rate", args.general_opponent_rate,
+        "--terminal-weight", args.terminal_weight,
+        "--crown-weight", args.crown_weight, "--tower-weight", args.tower_weight,
+        *( ["--randomize-reactive"] if args.randomize_reactive
+           else ["--no-randomize-reactive"] ),
     ])
 
 
@@ -213,7 +222,7 @@ def main() -> int:
     p.add_argument("--init", type=Path, default=TARGET_CKPT)
     p.add_argument("--ref", type=Path, default=None)
     p.add_argument("--opponent", type=Path, default=BASE_CKPT)
-    p.add_argument("--name", default="drill_selfplay")
+    p.add_argument("--name", default="drill_selfplay_curriculum")
     p.add_argument("--iters", type=int, default=40)
     p.add_argument("--matches", type=int, default=48)
     p.add_argument("--workers", type=int, default=6)
@@ -221,6 +230,16 @@ def main() -> int:
     p.add_argument("--eval-matches", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--kl", type=float, default=0.05)
+    p.add_argument("--reactive-start", type=float, default=0.25)
+    p.add_argument("--reactive-end", type=float, default=0.75)
+    p.add_argument("--curriculum-iters", type=int, default=20)
+    p.add_argument("--opponent-decide-start", type=int, default=20)
+    p.add_argument("--opponent-decide-end", type=int, default=10)
+    p.add_argument("--general-opponent-rate", type=float, default=0.5)
+    p.add_argument("--randomize-reactive", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--terminal-weight", type=float, default=0.7)
+    p.add_argument("--crown-weight", type=float, default=0.1)
+    p.add_argument("--tower-weight", type=float, default=0.2)
     p.set_defaults(func=selfplay)
 
     args = parser.parse_args()
