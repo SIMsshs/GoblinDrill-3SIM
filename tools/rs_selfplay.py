@@ -102,6 +102,23 @@ def evaluation_score(summary):
     return result, float(summary.get("crown_diff", -999.0))
 
 
+def evaluate_checkpoint(args, checkpoint, python):
+    """Evaluate one checkpoint on the fixed shuffled-start promotion set."""
+    result = subprocess.run([
+        str(python), str(ROOT / "tools" / "rs_eval.py"),
+        "--ckpt", str(checkpoint), "--opponent-ckpt", args.eval_opponent,
+        "--matches", str(args.eval_matches), "--workers", str(args.workers),
+        "--delay", "21", "--lead", "-21", "--deck-config", str(args.deck_config),
+        "--shuffle-starts", "--seed", str(args.eval_seed), "--json",
+    ], capture_output=True, text=True)
+    if result.returncode:
+        return None, result.stderr[-500:]
+    try:
+        return json.loads(result.stdout.strip().splitlines()[-1]), None
+    except (IndexError, json.JSONDecodeError):
+        return None, "evaluation returned no JSON summary"
+
+
 # ----------------------------------------------------------------------------
 # collect (royalegym env)
 # ----------------------------------------------------------------------------
@@ -505,6 +522,22 @@ def loop(args):
         print(json.dumps({"status": "already_complete", "iterations": start,
                           "run": str(run)}), flush=True)
         return 0
+    best_meta = run / "best.json"
+    if args.eval_every and not best_meta.exists():
+        baseline, error = evaluate_checkpoint(args, ckpt, rg)
+        if error:
+            print(f"baseline evaluation failed: {error}", flush=True)
+            return 1
+        import shutil
+        shutil.copy2(ckpt, run / "best.pt")
+        best = {"checkpoint": ckpt.name, "score": list(evaluation_score(baseline)),
+                "evaluation": baseline, "baseline": True}
+        best_meta.write_text(json.dumps(best, indent=2))
+        baseline_record = {"iter": -1, "baseline_eval": baseline,
+                           "new_best": ckpt.name}
+        with log.open("a") as fh:
+            fh.write(json.dumps(baseline_record) + "\n")
+        print(json.dumps(baseline_record), flush=True)
     for it in range(start, args.iters):
         ckpt = run / f"it{it:03d}.pt"
         data = run / f"it{it:03d}.npz"
@@ -546,31 +579,21 @@ def loop(args):
                "opponent_decide": opponent_decide,
                **{f"collect_{k}": v for k, v in col.items()}, **tr}
         if args.eval_every and (it + 1) % args.eval_every == 0:
-            e = subprocess.run([str(rg), str(ROOT / "tools" / "rs_eval.py"), "--ckpt", str(nxt),
-                                "--opponent-ckpt", args.eval_opponent, "--matches", str(args.eval_matches),
-                                "--workers", str(args.workers), "--delay", "21", "--lead", "-21",
-                                "--deck-config", str(args.deck_config), "--json"],
-                               capture_output=True, text=True)
-            if e.returncode:
-                rec["eval_error"] = e.stderr[-500:]
+            summary, error = evaluate_checkpoint(args, nxt, rg)
+            if error:
+                rec["eval_error"] = error
             else:
-                try:
-                    summary = json.loads(e.stdout.strip().splitlines()[-1])
-                except (IndexError, json.JSONDecodeError):
-                    rec["eval_error"] = "evaluation returned no JSON summary"
-                else:
-                    rec["eval"] = summary
-                    score = evaluation_score(summary)
-                    best_meta = run / "best.json"
-                    previous = json.loads(best_meta.read_text()) if best_meta.exists() else None
-                    old_score = tuple(previous["score"]) if previous else (-1.0, -999.0)
-                    if score > old_score:
-                        import shutil
-                        shutil.copy2(nxt, run / "best.pt")
-                        best = {"checkpoint": nxt.name, "score": list(score),
-                                "evaluation": summary}
-                        best_meta.write_text(json.dumps(best, indent=2))
-                        rec["new_best"] = nxt.name
+                rec["eval"] = summary
+                score = evaluation_score(summary)
+                previous = json.loads(best_meta.read_text())
+                old_score = tuple(previous["score"])
+                if score > old_score:
+                    import shutil
+                    shutil.copy2(nxt, run / "best.pt")
+                    best = {"checkpoint": nxt.name, "score": list(score),
+                            "evaluation": summary}
+                    best_meta.write_text(json.dumps(best, indent=2))
+                    rec["new_best"] = nxt.name
         rec["seconds"] = round(time.time() - t0)
         with log.open("a") as fh:
             fh.write(json.dumps(rec) + "\n")
@@ -642,6 +665,8 @@ def main() -> int:
     lp.add_argument("--tower-weight", type=float, default=0.2)
     lp.add_argument("--eval-every", type=int, default=5)
     lp.add_argument("--eval-matches", type=int, default=300)
+    lp.add_argument("--eval-seed", type=int, default=9000,
+                    help="fixed shuffled-start seed used to compare every checkpoint fairly")
     lp.add_argument("--eval-opponent", default=str(ROOT / "runs" / "tokens" / "rs_bc" / "ep1.pt"),
                     help="the reference every earlier number was measured against")
     lp.add_argument("--deck-config", type=Path,

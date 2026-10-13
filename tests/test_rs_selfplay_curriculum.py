@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from tools.rs_eval import next_wakeup_tick, unsupported_deck_cards
+from tools.rs_eval import evaluation_schedule, next_wakeup_tick, unsupported_deck_cards
 from tools.rs_selfplay import evaluation_score, gate_probs, linear_schedule, shaped_return
 
 
@@ -50,6 +50,12 @@ def test_evaluation_score_prefers_results_then_crown_margin():
     assert evaluation_score(two_draws) > evaluation_score(one_win_one_loss)
 
 
+def test_an_existing_baseline_cannot_be_replaced_by_a_worse_first_candidate():
+    baseline = {"wins": 4, "draws": 0, "n": 10, "crown_diff": -0.2}
+    worse = {"wins": 3, "draws": 1, "n": 10, "crown_diff": 0.5}
+    assert evaluation_score(worse) < evaluation_score(baseline)
+
+
 def test_gate_distribution_masks_actions_and_sums_to_one():
     logits = np.asarray([1.0, 2.0, 3.0, -4.0, 0.5])
     mask = np.asarray([True, True, False, True, True])
@@ -65,3 +71,17 @@ def test_unsupported_card_scan_checks_both_decks():
         "opponent": {"players": [{"deck": [{"card_key": "void"}]}]},
     }
     assert unsupported_deck_cards(battle, {"tesla": "Tesla"}) == {"void"}
+
+
+def test_recorded_eval_never_reuses_a_replay_template():
+    assert evaluation_schedule(13, 100, seed=9000, shuffle_starts=False) == [
+        (index, 9000 + index) for index in range(13)
+    ]
+
+
+def test_reactive_eval_reuses_templates_with_fresh_shuffled_seeds():
+    schedule = evaluation_schedule(13, 52, seed=9000, shuffle_starts=True)
+    assert len(schedule) == 52
+    assert schedule[:3] == [(0, 9000), (1, 9001), (2, 9002)]
+    assert schedule[13] == (0, 9013)
+    assert len({seed for _, seed in schedule}) == 52
