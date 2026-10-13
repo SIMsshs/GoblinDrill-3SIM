@@ -775,7 +775,8 @@ def play(args):
     real_target = (("win" if real in ("victory", "win") else "loss" if real in ("defeat", "loss") else "draw")
                    if target_seat == 0 else
                    ("loss" if real in ("victory", "win") else "win" if real in ("defeat", "loss") else "draw"))
-    return {"tag": p["source"]["replay_tag"], "mode": mode_, "real": real_target,
+    return {"tag": p["source"]["replay_tag"], "seed": seed,
+            "mode": mode_, "real": real_target,
             "game_over": state["game_over"], "end_tick": state["tick"],
             "result": "win" if w == target_team else "loss" if w in (0, 1) else "draw",
             "crowns": [state["players"][target_team]["crowns"], state["players"][1 - target_team]["crowns"]],
@@ -785,11 +786,29 @@ def play(args):
             "target_team": target_team}
 
 
+def evaluation_schedule(template_count: int, requested_matches: int, seed: int,
+                        shuffle_starts: bool) -> list[tuple[int, int]]:
+    """Return (template index, simulator seed) pairs for a fair evaluation.
+
+    Recorded-ghost comparisons must use each replay at most once because their
+    commands assume the recorded starting hand.  A reactive opponent does not
+    replay those commands, so with shuffled starts the held-out deck templates
+    can safely be cycled until the requested number of independent trials is
+    reached.
+    """
+    if template_count <= 0 or requested_matches <= 0:
+        return []
+    total = requested_matches if shuffle_starts else min(template_count, requested_matches)
+    return [(index % template_count, seed + index) for index in range(total)]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="")
     ap.add_argument("--matches", type=int, default=300)
     ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="first simulator seed; use the same value for fair A/B comparisons")
     ap.add_argument("--pro", action="store_true", help="run the recorded-pro baseline instead")
     ap.add_argument("--search", action="store_true", help="decision-time search")
     ap.add_argument("--spell-aim", action="store_true",
@@ -809,11 +828,19 @@ def main() -> int:
     ap.add_argument("--opponent-ckpt", default="",
                     help="a reactive opponent: this checkpoint plays the recorded opponent's "
                          "deck instead of the ghost replaying its commands")
+    ap.add_argument("--shuffle-starts", action=argparse.BooleanOptionalAction, default=False,
+                    help="shuffle both decks and reuse held-out deck templates until --matches "
+                         "trials are reached; requires --opponent-ckpt")
+    ap.add_argument("--opponent-decide", type=int, default=DECIDE,
+                    help="reactive opponent decision interval in 20 Hz ticks")
     ap.add_argument("--deck-config", type=Path, default=DEFAULT_DECK_CONFIG,
                     help="target deck JSON (cards and evolution/hero forms)")
     ap.add_argument("--json", action="store_true",
                     help="also print a machine-readable summary as the last line")
     args = ap.parse_args()
+    if args.shuffle_starts and not args.opponent_ckpt:
+        ap.error("--shuffle-starts requires --opponent-ckpt; recorded ghost commands "
+                 "are not valid after changing the starting hand")
     import pyarrow.parquet as pq
     royalesim, names, ids, cat = RR._setup()
     target_config = load_deck_config(args.deck_config)
@@ -849,18 +876,24 @@ def main() -> int:
         details = ", ".join(f"{card} ({count})" for card, count in unsupported.most_common())
         print(f"skipped {skipped_unsupported} held-out matches with unsupported "
               f"RoyaleSim cards: {details}", flush=True)
-    print(f"selected {len(picked)} held-out {target_config.label} matches", flush=True)
+    schedule = evaluation_schedule(len(picked), args.matches, args.seed, args.shuffle_starts)
+    print(f"selected {len(picked)} held-out {target_config.label} templates for "
+          f"{len(schedule)} evaluation trials", flush=True)
     t0 = time.time()
+    tasks = [(picked[template_index], args.ckpt, mode_, trial_seed,
+              args.opponent_ckpt, args.delay, args.lead, args.hold_pending,
+              args.shadow, args.spell_aim, str(target_config.source),
+              args.shuffle_starts, args.opponent_decide)
+             for template_index, trial_seed in schedule]
     with ProcessPoolExecutor(args.workers) as pool:
-        rows = [r for r in pool.map(play, [(t, args.ckpt, mode_, k, args.opponent_ckpt, args.delay, args.lead,
-                                        args.hold_pending, args.shadow, args.spell_aim,
-                                        str(target_config.source))
-                                       for k, t in enumerate(picked)])
+        rows = [r for r in pool.map(play, tasks)
                 if r]
     wins = sum(r["result"] == "win" for r in rows)
     draws = sum(r["result"] == "draw" for r in rows)
     lo, hi = wilson(wins, len(rows))
     cd = sum(r["crowns"][0] - r["crowns"][1] for r in rows) / max(1, len(rows))
+    td = sum(r["tower_fraction"][0] - r["tower_fraction"][1]
+             for r in rows) / max(1, len(rows))
     name = ("recorded pro" if args.pro else
             Path(args.ckpt).parent.name + (" +search" if args.search else "")
             + (" (rebuilt)" if args.rebuild else "")
@@ -880,9 +913,12 @@ def main() -> int:
           f"{draws} draws, crown diff {cd:+.2f}, agent plays/match "
           f"{plays_per_match:.1f} ({elapsed:.0f}s)")
     summary = {"name": name, "ckpt": args.ckpt, "wins": wins, "draws": draws,
-               "n": len(rows), "win_rate": wins / max(1, len(rows)),
+               "losses": len(rows) - wins - draws, "n": len(rows),
+               "templates": len(picked), "seed": args.seed,
+               "shuffle_starts": args.shuffle_starts,
+               "win_rate": wins / max(1, len(rows)),
                "result_score": (wins + 0.5 * draws) / max(1, len(rows)),
-               "ci": [lo, hi], "crown_diff": cd,
+               "ci": [lo, hi], "crown_diff": cd, "tower_diff": td,
                "agent_plays_per_match": plays_per_match,
                "seconds": round(elapsed, 1)}
     out = ROOT / "reports" / "rs_ghost.jsonl"

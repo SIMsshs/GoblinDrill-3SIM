@@ -128,6 +128,11 @@ def evaluate(args) -> int:
     else:
         _need(args.ckpt, "Run the `finetune` stage first, or pass --ckpt explicitly.")
         command += ["--ckpt", args.ckpt]
+        if args.opponent:
+            command += ["--opponent-ckpt", args.opponent,
+                        "--seed", args.seed, "--opponent-decide", args.opponent_decide]
+            if args.shuffle_starts:
+                command.append("--shuffle-starts")
     return _run(command)
 
 
@@ -141,7 +146,8 @@ def selfplay(args) -> int:
         "--opponent", args.opponent, "--eval-opponent", args.opponent,
         "--iters", args.iters, "--matches", args.matches,
         "--workers", args.workers, "--eval-every", args.eval_every,
-        "--eval-matches", args.eval_matches, "--lr", args.lr, "--kl", args.kl,
+        "--eval-matches", args.eval_matches, "--eval-seed", args.eval_seed,
+        "--lr", args.lr, "--kl", args.kl,
         "--reactive-start", args.reactive_start, "--reactive-end", args.reactive_end,
         "--curriculum-iters", args.curriculum_iters,
         "--opponent-decide-start", args.opponent_decide_start,
@@ -215,6 +221,11 @@ def main() -> int:
     p.add_argument("--workers", type=int, default=6)
     p.add_argument("--delay", type=int, default=21)
     p.add_argument("--lead", type=int, default=-21)
+    p.add_argument("--opponent", type=Path, default=None,
+                   help="reactive opponent checkpoint; omit for recorded-ghost evaluation")
+    p.add_argument("--seed", type=int, default=9000)
+    p.add_argument("--opponent-decide", type=int, default=10)
+    p.add_argument("--shuffle-starts", action=argparse.BooleanOptionalAction, default=True)
     p.set_defaults(func=evaluate)
 
     p = sub.add_parser("selfplay", help="PPO fine-tuning with an imitation KL brake")
@@ -228,6 +239,7 @@ def main() -> int:
     p.add_argument("--workers", type=int, default=6)
     p.add_argument("--eval-every", type=int, default=5)
     p.add_argument("--eval-matches", type=int, default=100)
+    p.add_argument("--eval-seed", type=int, default=9000)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--kl", type=float, default=0.05)
     p.add_argument("--reactive-start", type=float, default=0.25)
